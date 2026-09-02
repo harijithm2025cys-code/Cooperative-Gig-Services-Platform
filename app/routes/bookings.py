@@ -74,11 +74,16 @@ def create_booking(
             "worker_id": payload.worker_id,
             "service_id": payload.service_id,
             "status": "pending",
-            "scheduled_time": scheduled_iso,
-            "created_at": now_iso
+            "requested_at": now_iso,
         }
 
-        res = db.table("bookings").insert(booking_record).execute()
+        try:
+            res = db.table("bookings").insert(booking_record).execute()
+        except Exception:
+            # Fallback if created_at / scheduled_time are present
+            booking_record["created_at"] = now_iso
+            booking_record["scheduled_time"] = scheduled_iso
+            res = db.table("bookings").insert(booking_record).execute()
         if not res.data:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

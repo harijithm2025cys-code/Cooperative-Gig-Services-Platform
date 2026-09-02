@@ -36,22 +36,24 @@ def register(
         user_id = str(uuid.uuid4())
         hashed_pwd = get_password_hash(payload.password)
         now_iso = datetime.now(timezone.utc).isoformat()
+        user_name = payload.name or payload.email.split("@")[0]
 
         # Insert into users table
         user_row = {
             "id": user_id,
+            "name": user_name,
             "email": payload.email,
             "phone": payload.phone,
             "role": payload.role,
+            "password": payload.password,
             "created_at": now_iso
         }
-        # Note: In production Supabase Auth or with a password column:
-        # We store or hash inside user record if column exists
+        
         try:
             user_res = db.table("users").insert(user_row).execute()
         except Exception:
-            # Fallback if users table requires additional fields or password column
-            user_row["password"] = hashed_pwd
+            # Fallback if password column is omitted
+            user_row.pop("password", None)
             user_res = db.table("users").insert(user_row).execute()
 
         profile_id = None
@@ -61,7 +63,7 @@ def register(
             household_row = {
                 "id": str(uuid.uuid4()),
                 "user_id": user_id,
-                "address": payload.address or "Default Address",
+                "address": payload.address or "Default City Address",
                 "latitude": payload.latitude or 12.9716,
                 "longitude": payload.longitude or 77.5946
             }
@@ -75,15 +77,21 @@ def register(
                 "id": str(uuid.uuid4()),
                 "user_id": user_id,
                 "cooperative_id": payload.cooperative_id,
-                "skill": payload.skill or "General Maintenance",
-                "service_area": payload.service_area or "Default District",
-                "rating": 0.0,
-                "availability": True,
-                "verified_status": False,
+                "skill": payload.skill or "Electrician",
                 "latitude": payload.latitude or 12.9716,
-                "longitude": payload.longitude or 77.5946
+                "longitude": payload.longitude or 77.5946,
+                "rating": 5.0,
+                "is_verified": True,
+                "is_available": True,
+                "experience_years": 3
             }
-            w_res = db.table("workers").insert(worker_row).execute()
+            try:
+                w_res = db.table("workers").insert(worker_row).execute()
+            except Exception:
+                # Fallback for alternative column naming
+                worker_row["availability"] = True
+                worker_row["verified_status"] = True
+                w_res = db.table("workers").insert(worker_row).execute()
             if w_res.data:
                 profile_id = w_res.data[0].get("id")
 
@@ -144,9 +152,9 @@ def login(
         role = user.get("role", "household")
 
         # Check password if stored in table
-        stored_hash = user.get("password") or user.get("password_hash")
-        if stored_hash:
-            if not verify_password(payload.password, stored_hash):
+        stored_pwd = user.get("password") or user.get("password_hash")
+        if stored_pwd:
+            if stored_pwd != payload.password and not verify_password(payload.password, stored_pwd):
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid email/phone or password."

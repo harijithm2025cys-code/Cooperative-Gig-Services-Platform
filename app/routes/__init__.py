@@ -5,6 +5,7 @@ from app.routes.matching import router as matching_router
 from app.routes.ratings import router as ratings_router
 from app.routes.admin import router as admin_router
 from app.routes.health import router as health_router
+from app.routes.verification import router as verification_router
 
 __all__ = [
     "auth_router",
@@ -14,4 +15,5 @@ __all__ = [
     "ratings_router",
     "admin_router",
     "health_router",
+    "verification_router",
 ]

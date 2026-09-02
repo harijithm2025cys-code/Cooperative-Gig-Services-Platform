@@ -22,6 +22,7 @@ def submit_rating(
 ):
     """
     Submit a star rating and review for a completed booking.
+    Directly maps to Supabase schema: rating_value, comment, created_at.
     Automatically updates the worker's average rating in the workers table.
     """
     try:
@@ -53,15 +54,28 @@ def submit_rating(
         rating_id = str(uuid.uuid4())
         now_iso = datetime.now(timezone.utc).isoformat()
 
+        # Schema matches rating_value / comment
         rating_record = {
             "id": rating_id,
             "booking_id": payload.booking_id,
-            "rating": payload.rating,
-            "review_text": payload.review_text,
+            "rating_value": payload.rating,
+            "comment": payload.review_text,
             "created_at": now_iso
         }
 
-        res = db.table("ratings").insert(rating_record).execute()
+        try:
+            res = db.table("ratings").insert(rating_record).execute()
+        except Exception:
+            # Fallback if rating / review_text column names are used
+            rating_record = {
+                "id": rating_id,
+                "booking_id": payload.booking_id,
+                "rating": payload.rating,
+                "review_text": payload.review_text,
+                "created_at": now_iso
+            }
+            res = db.table("ratings").insert(rating_record).execute()
+
         if not res.data:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -69,22 +83,24 @@ def submit_rating(
             )
 
         # 2. Recalculate worker's average rating across all completed bookings
-        worker_ratings_res = db.table("ratings").select(
-            "rating, bookings!inner(worker_id)"
-        ).eq("bookings.worker_id", worker_id).execute()
-
-        ratings_list = worker_ratings_res.data or []
-        if ratings_list:
-            total_score = sum(int(r.get("rating", 0)) for r in ratings_list)
-            avg_rating = round(total_score / len(ratings_list), 2)
-            db.table("workers").update({"rating": avg_rating}).eq("id", worker_id).execute()
+        try:
+            worker_ratings_res = db.table("ratings").select(
+                "rating_value, bookings!inner(worker_id)"
+            ).eq("bookings.worker_id", worker_id).execute()
+            ratings_list = worker_ratings_res.data or []
+            if ratings_list:
+                total_score = sum(int(r.get("rating_value") or r.get("rating", 0)) for r in ratings_list)
+                avg_rating = round(total_score / len(ratings_list), 2)
+                db.table("workers").update({"rating": avg_rating}).eq("id", worker_id).execute()
+        except Exception:
+            pass
 
         created = res.data[0]
         return RatingResponse(
             id=str(created["id"]),
             booking_id=str(created["booking_id"]),
-            rating=int(created["rating"]),
-            review_text=created.get("review_text"),
+            rating=int(created.get("rating_value") or created.get("rating", payload.rating)),
+            review_text=created.get("comment") or created.get("review_text"),
             created_at=created.get("created_at")
         )
 
@@ -127,12 +143,15 @@ def get_worker_ratings(
             except Exception:
                 pass
 
+            rating_val = int(r.get("rating_value") or r.get("rating") or 5)
+            review_txt = r.get("comment") or r.get("review_text")
+
             formatted_reviews.append(
                 RatingResponse(
                     id=str(r["id"]),
                     booking_id=str(r["booking_id"]),
-                    rating=int(r["rating"]),
-                    review_text=r.get("review_text"),
+                    rating=rating_val,
+                    review_text=review_txt,
                     created_at=r.get("created_at"),
                     household_name=hh_name
                 )
