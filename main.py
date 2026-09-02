@@ -1,344 +1,209 @@
-# main.py
+#!/usr/bin/env python3
+"""
+Seed script for the home services database.
+Inserts cooperatives, services, worker/household users and their profiles.
+"""
+
 import os
-import math
-from typing import List, Optional
-from datetime import datetime, timezone
-
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from supabase import create_client, Client
+import random
+import sys
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
-# Load environment variables (SUPABASE_URL, SUPABASE_KEY)
+# Load environment variables
 load_dotenv()
-
-# Initialize FastAPI app
-app = FastAPI(title="Cooperative Gig Services Platform API")
-
-# CORS – allow all origins (for Flutter development)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],            # In production, restrict to your Flutter app URL
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Supabase client setup
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Missing Supabase credentials in environment variables")
 
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("ERROR: SUPABASE_URL and SUPABASE_KEY must be set in .env")
+    sys.exit(1)
+
+# Create Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ============================================================
-# Pydantic Models (Request Bodies)
-# ============================================================
+# ----------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------
+BASE_LAT = 13.0827   # Chennai latitude
+BASE_LON = 80.2707   # Chennai longitude
+RADIUS_DEG = 0.09    # ~10 km (1 deg lat ≈ 111 km)
 
-class UserRegister(BaseModel):
-    name: str
-    phone: str
-    email: Optional[str] = None
-    role: str = Field(..., pattern="^(household|worker|admin)$")  # only these roles
+# ----------------------------------------------------------------------
+# Helper functions
+# ----------------------------------------------------------------------
+def random_coord():
+    """Return (lat, lon) within ~10 km of Chennai."""
+    lat = BASE_LAT + random.uniform(-RADIUS_DEG, RADIUS_DEG)
+    lon = BASE_LON + random.uniform(-RADIUS_DEG, RADIUS_DEG)
+    return round(lat, 6), round(lon, 6)
 
-class WorkerProfile(BaseModel):
-    user_id: str               # UUID of the user (must exist and role='worker')
-    skill: str                 # e.g., "electrician", "plumber", "caregiver", "driver", "cleaner"
-    latitude: float
-    longitude: float
-    cooperative_id: Optional[str] = None   # UUID of cooperative (optional)
+def safe_insert(table: str, data: dict, context: str):
+    """Insert one row and return the inserted record (with id)."""
+    try:
+        result = supabase.table(table).insert(data).execute()
+        if not result.data:
+            raise Exception(f"No data returned from insert into {table}")
+        return result.data[0]
+    except Exception as e:
+        print(f"❌ ERROR during insert into {table}: {context}")
+        print(f"   Details: {e}")
+        sys.exit(1)
 
-class BookingCreate(BaseModel):
-    household_id: str          # UUID of household
-    service_id: str            # UUID of service (determines skill)
-    latitude: Optional[float] = None   # optional override of household location
-    longitude: Optional[float] = None
+def safe_insert_many(table: str, data_list: list, context: str):
+    """Insert multiple rows and return the list of inserted records."""
+    try:
+        result = supabase.table(table).insert(data_list).execute()
+        if not result.data:
+            raise Exception(f"No data returned from insert into {table}")
+        return result.data
+    except Exception as e:
+        print(f"❌ ERROR during batch insert into {table}: {context}")
+        print(f"   Details: {e}")
+        sys.exit(1)
 
-class BookingStatusUpdate(BaseModel):
-    status: str = Field(..., pattern="^(accepted|in_progress|completed|cancelled)$")
+# ----------------------------------------------------------------------
+# Seed data definitions
+# ----------------------------------------------------------------------
+cooperatives_data = [
+    {"name": "Chennai South Cooperative", "district": "Chennai", "state": "Tamil Nadu"},
+    {"name": "Chennai North Cooperative", "district": "Chennai", "state": "Tamil Nadu"},
+]
 
-# ============================================================
-# Helper Functions
-# ============================================================
+services_data = [
+    {"name": "electrician", "category": "Home Repair"},
+    {"name": "plumber", "category": "Home Repair"},
+    {"name": "caregiver", "category": "Care Services"},
+    {"name": "driver", "category": "Transport"},
+    {"name": "cleaner", "category": "Home Services"},
+]
 
-def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """
-    Calculate the great-circle distance between two points on Earth (in kilometers).
-    """
-    R = 6371.0  # Earth radius in km
-    lat1_rad = math.radians(lat1)
-    lat2_rad = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
+# 12 workers with realistic names, skills and cooperative assignment (0 or 1)
+workers_info = [
+    # Electricians (3)
+    {"name": "Rajesh Kumar", "phone": "9840123450", "email": "rajesh.kumar@example.com", "skill": "electrician", "coop_idx": 0},
+    {"name": "Suresh Babu", "phone": "9840123451", "email": "suresh.babu@example.com", "skill": "electrician", "coop_idx": 1},
+    {"name": "Mani Vannan", "phone": "9840123452", "email": "mani.vannan@example.com", "skill": "electrician", "coop_idx": 0},
+    # Plumbers (3)
+    {"name": "Karthik Raja", "phone": "9840123453", "email": "karthik.raja@example.com", "skill": "plumber", "coop_idx": 1},
+    {"name": "Prakash Raj", "phone": "9840123454", "email": "prakash.raj@example.com", "skill": "plumber", "coop_idx": 0},
+    {"name": "Vinoth Kumar", "phone": "9840123455", "email": "vinoth.kumar@example.com", "skill": "plumber", "coop_idx": 1},
+    # Caregivers (2)
+    {"name": "Lakshmi Narayanan", "phone": "9840123456", "email": "lakshmi.narayanan@example.com", "skill": "caregiver", "coop_idx": 0},
+    {"name": "Meenakshi Sundaram", "phone": "9840123457", "email": "meenakshi.sundaram@example.com", "skill": "caregiver", "coop_idx": 1},
+    # Drivers (2)
+    {"name": "Ganesh Moorthy", "phone": "9840123458", "email": "ganesh.moorthy@example.com", "skill": "driver", "coop_idx": 0},
+    {"name": "Selvamani", "phone": "9840123459", "email": "selvamani@example.com", "skill": "driver", "coop_idx": 1},
+    # Cleaners (2)
+    {"name": "Murugan", "phone": "9840123460", "email": "murugan@example.com", "skill": "cleaner", "coop_idx": 0},
+    {"name": "Ravi Shankar", "phone": "9840123461", "email": "ravi.shankar@example.com", "skill": "cleaner", "coop_idx": 1},
+]
 
-    a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+households_info = [
+    {"name": "Anitha Ramesh", "phone": "9840123470", "email": "anitha.ramesh@example.com", "address": "12, Gandhi Street, T. Nagar, Chennai"},
+    {"name": "Kavitha Srinivasan", "phone": "9840123471", "email": "kavitha.srinivasan@example.com", "address": "45, Anna Salai, Chennai"},
+    {"name": "Deepak Kumar", "phone": "9840123472", "email": "deepak.kumar@example.com", "address": "78, Velachery Main Road, Chennai"},
+    {"name": "Priya Raman", "phone": "9840123473", "email": "priya.raman@example.com", "address": "23, Mylapore, Chennai"},
+]
 
-def calculate_match_score(worker: dict, request_lat: float, request_lng: float) -> float:
-    """
-    Compute match score for a worker based on:
-      - Skill match: 50 pts (already filtered in query)
-      - Distance: up to 30 pts (closer = more points, only if within 10 km)
-      - Rating: rating * 4 pts (max 20 pts)
-    Returns total score (max 100).
-    """
-    # Skill match is assumed 50 (pre-filtered)
-    skill_score = 50.0
+# ----------------------------------------------------------------------
+# Counters for summary
+# ----------------------------------------------------------------------
+counts = {
+    "cooperatives": 0,
+    "services": 0,
+    "users": 0,
+    "workers": 0,
+    "households": 0,
+}
 
-    # Distance score (only if worker has coordinates)
-    distance_score = 0.0
-    distance_km = None
-    if worker.get("latitude") is not None and worker.get("longitude") is not None:
-        distance_km = haversine(request_lat, request_lng, worker["latitude"], worker["longitude"])
-        if distance_km <= 10:
-            # Scale: 0 km -> 30 pts, 10 km -> 0 pts
-            distance_score = 30 * (1 - distance_km / 10.0)
-        else:
-            distance_score = 0.0
-    else:
-        # No coordinates – give average distance score
-        distance_score = 15.0
+# ----------------------------------------------------------------------
+# Seeding process
+# ----------------------------------------------------------------------
+print("\n🚀 Starting database seed...\n")
 
-    # Rating score
-    rating = worker.get("rating", 0.0)
-    rating_score = rating * 4.0  # max 5 * 4 = 20
+# 1. Insert cooperatives
+print("Inserting cooperatives...")
+coop_records = safe_insert_many("cooperatives", cooperatives_data, "cooperatives")
+counts["cooperatives"] = len(coop_records)
+print(f"✅ Inserted {counts['cooperatives']} cooperatives\n")
 
-    total = skill_score + distance_score + rating_score
-    return total, distance_km, distance_score, rating_score
+# 2. Insert services
+print("Inserting services...")
+service_records = safe_insert_many("services", services_data, "services")
+counts["services"] = len(service_records)
+print(f"✅ Inserted {counts['services']} services\n")
 
-# ============================================================
-# API Endpoints
-# ============================================================
-
-@app.post("/register", response_model=dict)
-async def register_user(user: UserRegister):
-    """
-    Create a new user (role: household, worker, or admin).
-    Returns the created user record.
-    """
-    # Insert into users table
-    data = {
-        "name": user.name,
-        "phone": user.phone,
-        "email": user.email,
-        "role": user.role,
+# 3. Insert worker users and profiles
+print("Inserting worker users and profiles...")
+for idx, w in enumerate(workers_info, start=1):
+    # Create user
+    user_data = {
+        "name": w["name"],
+        "phone": w["phone"],
+        "email": w["email"],
+        "role": "worker",
+        "created_at": "now()",  # Supabase will use default if omitted, but we can set explicitly
     }
-    result = supabase.table("users").insert(data).execute()
+    user_record = safe_insert("users", user_data, f"worker user {w['name']}")
+    counts["users"] += 1
 
-    # Check if insert was successful
-    if not result.data:
-        raise HTTPException(status_code=400, detail="Could not create user")
-    return {"user": result.data[0]}
-
-@app.post("/workers/profile", response_model=dict)
-async def create_worker_profile(profile: WorkerProfile):
-    """
-    Create a worker profile for an existing user.
-    user_id must exist in users table and have role='worker'.
-    """
-    # Check that the user exists and has role 'worker'
-    user = supabase.table("users").select("*").eq("id", profile.user_id).execute()
-    if not user.data:
-        raise HTTPException(status_code=404, detail="User not found")
-    if user.data[0]["role"] != "worker":
-        raise HTTPException(status_code=400, detail="User role is not 'worker'")
-
-    # Check if worker profile already exists for this user
-    existing = supabase.table("workers").select("*").eq("user_id", profile.user_id).execute()
-    if existing.data:
-        raise HTTPException(status_code=400, detail="Worker profile already exists")
-
-    # Insert worker profile
-    data = {
-        "user_id": profile.user_id,
-        "skill": profile.skill,
-        "latitude": profile.latitude,
-        "longitude": profile.longitude,
-        "cooperative_id": profile.cooperative_id,
-        "is_verified": False,      # default false
-        "is_available": True,      # default true
-        "rating": 0.0,             # start with 0 rating
+    # Create worker profile
+    lat, lon = random_coord()
+    rating = round(random.uniform(3.5, 5.0), 1)
+    worker_data = {
+        "user_id": user_record["id"],
+        "skill": w["skill"],
+        "cooperative_id": coop_records[w["coop_idx"]]["id"],
+        "latitude": lat,
+        "longitude": lon,
+        "rating": rating,
+        "is_verified": True,
+        "is_available": True,
     }
-    result = supabase.table("workers").insert(data).execute()
-    if not result.data:
-        raise HTTPException(status_code=400, detail="Failed to create worker profile")
-    return {"worker": result.data[0]}
+    safe_insert("workers", worker_data, f"worker profile for {w['name']}")
+    counts["workers"] += 1
+    print(f"  ✅ ({idx}/{len(workers_info)}) Created {w['name']} as {w['skill']}")
 
-@app.get("/workers/available", response_model=dict)
-async def get_available_workers(
-    skill: str = Query(..., description="Skill category, e.g., electrician"),
-    lat: float = Query(..., description="Request latitude"),
-    lng: float = Query(..., description="Request longitude"),
-):
-    """
-    Get all available workers with the given skill, sorted by match score (descending).
-    Returns a list of workers with their score, distance, etc.
-    """
-    # Query workers: skill match and is_available = true
-    result = supabase.table("workers").select("*").eq("skill", skill).eq("is_available", True).execute()
-    workers = result.data
+print(f"✅ Inserted {counts['workers']} worker profiles\n")
 
-    if not workers:
-        return {"workers": [], "message": "No available workers found"}
-
-    # Calculate match score for each worker
-    scored_workers = []
-    for worker in workers:
-        total_score, distance_km, distance_score, rating_score = calculate_match_score(worker, lat, lng)
-        worker["match_score"] = round(total_score, 2)
-        worker["distance_km"] = round(distance_km, 2) if distance_km is not None else None
-        worker["distance_score"] = round(distance_score, 2)
-        worker["rating_score"] = round(rating_score, 2)
-        scored_workers.append(worker)
-
-    # Sort by match_score descending
-    scored_workers.sort(key=lambda x: x["match_score"], reverse=True)
-
-    return {"workers": scored_workers}
-
-@app.post("/bookings", response_model=dict)
-async def create_booking(booking: BookingCreate):
-    """
-    Create a service request (booking).
-    - household_id must exist
-    - service_id determines the required skill
-    - Optionally override household location with lat/lng
-    - Automatically picks the best available worker for that skill
-    """
-    # 1. Verify household exists
-    household = supabase.table("households").select("*").eq("id", booking.household_id).execute()
-    if not household.data:
-        raise HTTPException(status_code=404, detail="Household not found")
-    household_data = household.data[0]
-
-    # 2. Get service details to determine skill
-    service = supabase.table("services").select("*").eq("id", booking.service_id).execute()
-    if not service.data:
-        raise HTTPException(status_code=404, detail="Service not found")
-    service_data = service.data[0]
-    required_skill = service_data["name"].lower()  # e.g., "electrician", "plumber"
-
-    # 3. Determine request location
-    req_lat = booking.latitude if booking.latitude is not None else household_data["latitude"]
-    req_lng = booking.longitude if booking.longitude is not None else household_data["longitude"]
-
-    if req_lat is None or req_lng is None:
-        raise HTTPException(status_code=400, detail="Household has no location and none provided")
-
-    # 4. Find best available worker
-    workers_result = supabase.table("workers").select("*").eq("skill", required_skill).eq("is_available", True).execute()
-    workers = workers_result.data
-
-    if not workers:
-        raise HTTPException(status_code=404, detail="No available workers for this skill")
-
-    best_worker = None
-    best_score = -1
-    for worker in workers:
-        score, _, _, _ = calculate_match_score(worker, req_lat, req_lng)
-        if score > best_score:
-            best_score = score
-            best_worker = worker
-
-    if not best_worker:
-        raise HTTPException(status_code=500, detail="Could not select a worker")
-
-    # 5. Create booking with status 'requested'
-    booking_data = {
-        "household_id": booking.household_id,
-        "worker_id": best_worker["id"],
-        "service_id": booking.service_id,
-        "status": "requested",
-        "requested_at": datetime.now(timezone.utc).isoformat(),
+# 4. Insert household users and profiles
+print("Inserting household users and profiles...")
+for idx, h in enumerate(households_info, start=1):
+    # Create user
+    user_data = {
+        "name": h["name"],
+        "phone": h["phone"],
+        "email": h["email"],
+        "role": "household",
+        "created_at": "now()",
     }
-    insert_result = supabase.table("bookings").insert(booking_data).execute()
-    if not insert_result.data:
-        raise HTTPException(status_code=400, detail="Failed to create booking")
+    user_record = safe_insert("users", user_data, f"household user {h['name']}")
+    counts["users"] += 1
 
-    # 6. Return booking details (with worker and household info)
-    created_booking = insert_result.data[0]
-    # Fetch worker info
-    worker_info = supabase.table("workers").select("*").eq("id", created_booking["worker_id"]).execute()
-    household_info = supabase.table("households").select("*").eq("id", created_booking["household_id"]).execute()
-    service_info = supabase.table("services").select("*").eq("id", created_booking["service_id"]).execute()
-
-    return {
-        "booking": created_booking,
-        "worker": worker_info.data[0] if worker_info.data else None,
-        "household": household_info.data[0] if household_info.data else None,
-        "service": service_info.data[0] if service_info.data else None,
-        "match_score": round(best_score, 2),
+    # Create household profile
+    lat, lon = random_coord()
+    household_data = {
+        "user_id": user_record["id"],
+        "address": h["address"],
+        "latitude": lat,
+        "longitude": lon,
     }
+    safe_insert("households", household_data, f"household profile for {h['name']}")
+    counts["households"] += 1
+    print(f"  ✅ ({idx}/{len(households_info)}) Created {h['name']}")
 
-@app.put("/bookings/{booking_id}/status", response_model=dict)
-async def update_booking_status(booking_id: str, update: BookingStatusUpdate):
-    """
-    Update the status of a booking.
-    Allowed statuses: accepted, in_progress, completed, cancelled.
-    """
-    # Check if booking exists
-    existing = supabase.table("bookings").select("*").eq("id", booking_id).execute()
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Booking not found")
+print(f"✅ Inserted {counts['households']} household profiles\n")
 
-    # Update status
-    update_data = {"status": update.status}
-    if update.status == "completed":
-        update_data["completed_at"] = datetime.now(timezone.utc).isoformat()
-
-    result = supabase.table("bookings").update(update_data).eq("id", booking_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=400, detail="Failed to update booking status")
-    return {"booking": result.data[0]}
-
-@app.get("/bookings/{booking_id}", response_model=dict)
-async def get_booking(booking_id: str):
-    """
-    Get full details of a single booking, including household, worker, and service info.
-    """
-    booking = supabase.table("bookings").select("*").eq("id", booking_id).execute()
-    if not booking.data:
-        raise HTTPException(status_code=404, detail="Booking not found")
-    booking_data = booking.data[0]
-
-    # Fetch related entities
-    household = supabase.table("households").select("*").eq("id", booking_data["household_id"]).execute()
-    worker = supabase.table("workers").select("*").eq("id", booking_data["worker_id"]).execute()
-    service = supabase.table("services").select("*").eq("id", booking_data["service_id"]).execute()
-
-    return {
-        "booking": booking_data,
-        "household": household.data[0] if household.data else None,
-        "worker": worker.data[0] if worker.data else None,
-        "service": service.data[0] if service.data else None,
-    }
-
-@app.get("/bookings/household/{household_id}", response_model=dict)
-async def list_household_bookings(household_id: str):
-    """
-    List all bookings for a given household.
-    """
-    bookings = supabase.table("bookings").select("*").eq("household_id", household_id).execute()
-    if not bookings.data:
-        return {"bookings": []}
-    return {"bookings": bookings.data}
-
-@app.get("/bookings/worker/{worker_id}", response_model=dict)
-async def list_worker_bookings(worker_id: str):
-    """
-    List all bookings for a given worker.
-    """
-    bookings = supabase.table("bookings").select("*").eq("worker_id", worker_id).execute()
-    if not bookings.data:
-        return {"bookings": []}
-    return {"bookings": bookings.data}
-
-# ============================================================
-# Run the app (for local development)
-# ============================================================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# ----------------------------------------------------------------------
+# Final summary
+# ----------------------------------------------------------------------
+print("=" * 50)
+print("🎉 Seed completed successfully!")
+print("=" * 50)
+print(f"Cooperatives : {counts['cooperatives']}")
+print(f"Services     : {counts['services']}")
+print(f"Users        : {counts['users']} (12 workers + 4 households)")
+print(f"Workers      : {counts['workers']}")
+print(f"Households   : {counts['households']}")
+print("=" * 50)
