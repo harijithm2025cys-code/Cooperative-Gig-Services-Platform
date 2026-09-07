@@ -1,6 +1,9 @@
+import logging
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from supabase import Client
+
+logger = logging.getLogger("workers_router")
 
 from app.db.supabase_client import get_supabase_client
 from app.core.dependencies import get_current_user
@@ -700,18 +703,25 @@ def complete_worker_service(
     db: Client = Depends(get_supabase_client)
 ):
     """
-    Worker completes service delivery.
-    Enforces sequential status check (must be IN_PROGRESS).
-    Transitions assignment and booking to COMPLETED.
+    Worker finishes service delivery.
+    Transitions assignment to COMPLETED, transitions booking to 'customer_confirmation_pending',
+    generates secure 6-digit customer inspection OTP, and notifies customer.
+    Worker response DOES NOT expose the OTP.
     """
-    from datetime import datetime
-    from app.services.matching import _ASSIGNMENTS_BY_ID, update_assignment_status_in_memory
+    from datetime import datetime, timezone
+    from app.services.matching import _ASSIGNMENTS_BY_ID, _BOOKINGS_BY_ID, update_assignment_status_in_memory
     from app.services.event_service import event_service
+    from app.services.otp_service import CompletionOtpService
+
+    # Validate worker authorization
+    if current_user.get("role") in ("cooperative_worker", "independent_worker"):
+        if str(current_user.get("id")) != str(worker_id) and str(current_user.get("worker_id")) != str(worker_id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized worker assignment.")
 
     asgn = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
     curr_status = (asgn.get("status") if asgn else "IN_PROGRESS").upper()
 
-    if curr_status not in ["IN_PROGRESS", "ARRIVED"]:
+    if curr_status not in ["IN_PROGRESS", "ARRIVED", "ACCEPTED"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot complete service from status '{curr_status}'. Must be in 'IN_PROGRESS' state."
@@ -719,34 +729,144 @@ def complete_worker_service(
 
     update_assignment_status_in_memory(assignment_id, "COMPLETED")
     booking_id = asgn.get("booking_id") if asgn else None
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    booking = _BOOKINGS_BY_ID.get(str(booking_id)) or {}
+    customer_id = booking.get("customer_id") or booking.get("household_id") or "usr_cust_01"
+
+    # Generate cryptographic completion OTP for customer inspection acceptance
+    if booking_id:
+        try:
+            CompletionOtpService.generate_completion_otp(
+                booking_id=str(booking_id),
+                customer_id=str(customer_id),
+                worker_id=str(worker_id),
+                assignment_id=str(assignment_id),
+                db=db
+            )
+        except Exception as e:
+            logger.warning(f"Completion OTP generation note: {e}")
 
     try:
         db.table("booking_assignments").update({"status": "COMPLETED"}).eq("id", assignment_id).execute()
         if booking_id:
-            db.table("bookings").update({"status": "completed", "check_out_time": now_iso}).eq("id", booking_id).execute()
+            db.table("bookings").update({
+                "status": "customer_confirmation_pending",
+                "check_out_time": now_iso
+            }).eq("id", booking_id).execute()
     except Exception:
         pass
 
-    if booking_id:
-        try:
-            event_service.publish_event(
-                event_type="SERVICE_COMPLETED",
-                booking_id=str(booking_id),
-                actor_id=str(worker_id),
-                actor_role="worker",
-                title="Service Completed",
-                description="Your requested service has been successfully completed. Thank you for supporting the Labour Cooperative!",
-                data={"assignment_id": assignment_id, "worker_id": worker_id}
-            )
-        except Exception:
-            pass
+    if booking:
+        booking["status"] = "customer_confirmation_pending"
+        booking["check_out_time"] = now_iso
+        _BOOKINGS_BY_ID[str(booking_id)] = booking
 
     return {
         "success": True,
         "assignment_id": assignment_id,
         "booking_id": booking_id,
-        "status": "COMPLETED",
-        "message": "Service successfully marked as completed."
+        "status": "CUSTOMER_CONFIRMATION_PENDING",
+        "message": "Service marked completed. Confirmation code sent to customer for inspection acceptance."
+    }
+
+@router.post("/{worker_id}/verify-completion-otp")
+def verify_worker_completion_otp(
+    worker_id: str,
+    payload: dict,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_supabase_client)
+):
+    """
+    Worker submits customer's 6-digit confirmation OTP after customer inspects work.
+    Enforces attempt limits, 15-min expiry, single-use, and worker authorization.
+    Transitions booking to COMPLETED and marks settlement_status = 'ELIGIBLE'.
+    """
+    from datetime import datetime, timezone
+    from app.services.otp_service import CompletionOtpService
+    from app.services.matching import _BOOKINGS_BY_ID
+    from app.services.payment_service import PaymentService, _PAYMENTS_BY_BOOKING_ID
+    from app.services.event_service import EventService
+
+    booking_id = payload.get("booking_id")
+    otp_code = payload.get("otp_code")
+    assignment_id = payload.get("assignment_id")
+
+    if not booking_id or not otp_code:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="booking_id and otp_code are required.")
+
+    # Validate OTP
+    is_valid, msg = CompletionOtpService.verify_completion_otp(
+        booking_id=str(booking_id),
+        worker_id=str(worker_id),
+        otp_code=str(otp_code),
+        assignment_id=str(assignment_id) if assignment_id else None,
+        db=db
+    )
+
+    if not is_valid:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Update booking in-memory
+    booking = _BOOKINGS_BY_ID.get(str(booking_id)) or {}
+    booking["status"] = "completed"
+    booking["settlement_status"] = "ELIGIBLE"
+    booking["check_out_time"] = now_iso
+    _BOOKINGS_BY_ID[str(booking_id)] = booking
+
+    pay_rec = _PAYMENTS_BY_BOOKING_ID.get(str(booking_id))
+    if pay_rec:
+        pay_rec["settlement_status"] = "ELIGIBLE"
+
+    if db:
+        try:
+            db.table("bookings").update({
+                "status": "completed",
+                "settlement_status": "ELIGIBLE",
+                "check_out_time": now_iso
+            }).eq("id", booking_id).execute()
+        except Exception as e:
+            logger.debug(f"DB update booking completion note: {e}")
+
+    # Record audit log
+    PaymentService.record_audit(
+        action="OTP_VERIFIED",
+        booking_id=str(booking_id),
+        actor_id=str(worker_id),
+        actor_role="worker",
+        metadata={"settlement_status": "ELIGIBLE"},
+        db=db
+    )
+    PaymentService.record_audit(
+        action="SETTLEMENT_MARKED_ELIGIBLE",
+        booking_id=str(booking_id),
+        actor_id=str(worker_id),
+        actor_role="system",
+        metadata={"payout_status": "eligible_for_disbursement"},
+        db=db
+    )
+
+    customer_id = booking.get("customer_id") or booking.get("household_id")
+    if customer_id:
+        EventService.dispatch_event(
+            event_type="SERVICE_CONFIRMED",
+            booking_id=str(booking_id),
+            actor_id=str(worker_id),
+            actor_role="worker",
+            data={"status": "completed", "settlement_status": "ELIGIBLE"},
+            target_user_ids=[str(customer_id)],
+            notification_title="Service Confirmed & Completed",
+            notification_message="Your OTP confirmation was verified. You can now view your official invoice and rate the service.",
+            db=db
+        )
+
+    return {
+        "success": True,
+        "booking_id": booking_id,
+        "status": "completed",
+        "settlement_status": "ELIGIBLE",
+        "message": "Customer acceptance confirmed. Service completed and settlement marked eligible."
     }
 

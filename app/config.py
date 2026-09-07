@@ -32,6 +32,11 @@ class Settings:
     # Google Maps Integration Key for Location & Proximity Tracking
     GOOGLE_MAPS_API_KEY: str = os.getenv("GOOGLE_MAPS_API_KEY", "AIzaSyCo_8I7zNvhpBL2KUYzqCGhueJl0B6Gl6Y")
 
+    # Razorpay Payment Gateway (Test Mode / Environment Secrets)
+    RAZORPAY_KEY_ID: str = os.getenv("RAZORPAY_KEY_ID", "rzp_test_coop_gig_2026")
+    RAZORPAY_KEY_SECRET: str = os.getenv("RAZORPAY_KEY_SECRET", "test_secret_coop_gig_2026")
+    RAZORPAY_WEBHOOK_SECRET: str = os.getenv("RAZORPAY_WEBHOOK_SECRET", "test_webhook_secret_coop_gig_2026")
+
     def validate_config(self):
         if not self.SUPABASE_URL or not self.SUPABASE_KEY:
             raise ValueError(

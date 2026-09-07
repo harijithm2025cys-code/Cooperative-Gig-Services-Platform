@@ -409,6 +409,7 @@ def allocate_workers_for_booking(
 _ASSIGNMENTS_BY_BOOKING: Dict[str, List[Dict[str, Any]]] = {}
 _ASSIGNMENTS_BY_WORKER: Dict[str, List[Dict[str, Any]]] = {}
 _ASSIGNMENTS_BY_ID: Dict[str, Dict[str, Any]] = {}
+_BOOKINGS_BY_ID: Dict[str, Dict[str, Any]] = {}
 _AUDIT_LOGS_BY_BOOKING: Dict[str, List[Dict[str, Any]]] = {}
 
 def record_allocation_assignments(booking_id: str, assignments: List[Dict[str, Any]], audit_logs: List[Dict[str, Any]]) -> None:

@@ -70,11 +70,14 @@ VALID_TRANSITIONS = {
     "on_the_way": ["arrived", "cancelled"],
     "arrived": ["in_progress", "verified_checkin", "cancelled"],
     "verified_checkin": ["in_progress"],
-    "in_progress": ["completed", "verified_checkout"],
+    "in_progress": ["customer_confirmation_pending", "completed", "verified_checkout"],
+    "customer_confirmation_pending": ["customer_confirmed", "completed", "disputed"],
+    "customer_confirmed": ["completed"],
     "verified_checkout": ["completed"],
     "completed": [],
     "cancelled": [],
     "rejected": [],
+    "disputed": ["completed", "cancelled"],
     "no_eligible_worker": ["matching", "cancelled"],
 }
 
@@ -1239,3 +1242,41 @@ def create_emergency_dispatch(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error processing emergency dispatch: {str(e)}"
         )
+
+@router.get("/{booking_id}/completion-otp")
+def get_completion_otp_for_customer(
+    booking_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_supabase_client)
+):
+    """
+    Retrieves the 6-digit service completion acceptance code strictly for the customer.
+    Workers and unauthorized parties are strictly forbidden from reading this endpoint.
+    """
+    from app.services.otp_service import CompletionOtpService, _COMPLETION_OTPS_BY_BOOKING
+
+    user_role = current_user.get("role", "customer")
+    if user_role in ("cooperative_worker", "independent_worker"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Workers are forbidden from reading the customer acceptance OTP."
+        )
+
+    otp_record = CompletionOtpService.get_customer_active_otp(booking_id, current_user["id"])
+    if not otp_record and user_role in ("super_admin", "admin"):
+        otp_record = _COMPLETION_OTPS_BY_BOOKING.get(str(booking_id))
+
+    if not otp_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active completion confirmation pending for this booking."
+        )
+
+    code = otp_record.get("plaintext_code") or "******"
+
+    return {
+        "booking_id": booking_id,
+        "otp_code": code,
+        "expires_at": otp_record.get("expires_at"),
+        "instructions": "Inspect completed work. Share this 6-digit code with the technician only if you are satisfied."
+    }
