@@ -232,16 +232,27 @@ def login(
                     detail="Invalid email/phone or password."
                 )
 
-        # Retrieve profile_id based on role
+        # Retrieve profile_id and cooperative_id based on role
         profile_id = None
-        if role == "household":
-            h_res = db.table("households").select("id").eq("user_id", user_id).execute()
-            if h_res.data:
-                profile_id = h_res.data[0]["id"]
-        elif role == "worker":
-            w_res = db.table("workers").select("id").eq("user_id", user_id).execute()
-            if w_res.data:
-                profile_id = w_res.data[0]["id"]
+        coop_id = user.get("cooperative_id")
+        worker_type = None
+        if role in ["household", "customer"]:
+            try:
+                h_res = db.table("households").select("id").eq("user_id", user_id).execute()
+                if h_res.data:
+                    profile_id = h_res.data[0]["id"]
+            except Exception:
+                pass
+        elif role in ["worker", "cooperative_worker", "independent_worker"]:
+            try:
+                w_res = db.table("workers").select("id, cooperative_id, worker_type").eq("user_id", user_id).execute()
+                if w_res.data:
+                    profile_id = w_res.data[0]["id"]
+                    if not coop_id:
+                        coop_id = w_res.data[0].get("cooperative_id")
+                    worker_type = w_res.data[0].get("worker_type")
+            except Exception:
+                pass
 
         access_token = create_access_token(
             subject=user_id,
@@ -255,7 +266,9 @@ def login(
             role=role,
             user_id=user_id,
             email=user.get("email"),
-            profile_id=profile_id
+            profile_id=profile_id,
+            cooperative_id=coop_id,
+            worker_type=worker_type
         )
 
     except HTTPException:

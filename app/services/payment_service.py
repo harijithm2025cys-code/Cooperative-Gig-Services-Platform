@@ -418,7 +418,7 @@ class PaymentService:
         if not record:
             raise ValueError(f"Payment '{payment_id}' not found.")
 
-        if record.get("status") not in ("CAPTURED", "DISPUTED"):
+        if (record.get("status") or "").upper() not in ("CAPTURED", "DISPUTED", "COMPLETED"):
             raise ValueError(f"Cannot refund payment with status '{record.get('status')}'. Must be CAPTURED or DISPUTED.")
 
         original_amount = float(record.get("amount", 0.0))
@@ -466,3 +466,5 @@ class PaymentService:
             "status": record["status"],
             "message": f"Refund of ₹{refund_amount:.2f} processed successfully."
         }
+
+    initiate_refund = process_refund

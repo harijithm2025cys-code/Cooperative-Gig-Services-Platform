@@ -12,6 +12,7 @@ from app.routes.notifications import router as notifications_router
 from app.routes.payments import router as payments_router
 from app.routes.invoices import router as invoices_router
 from app.routes.complaints import router as complaints_router
+from app.routes.association import router as association_router
 
 __all__ = [
     "auth_router",
@@ -28,6 +29,7 @@ __all__ = [
     "payments_router",
     "invoices_router",
     "complaints_router",
+    "association_router",
 ]
 
 
