@@ -186,15 +186,30 @@ def rank_workers_for_booking(
     available_workers: List[Dict[str, Any]],
     worker_active_counts: Optional[Dict[str, int]] = None,
     worker_monthly_counts: Optional[Dict[str, int]] = None,
-    is_emergency: bool = False
+    is_emergency: bool = False,
+    booking_context: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Ranks candidate workers against a booking request using enhanced Fair Balancing Score (Fi).
-    Returns candidates sorted by total score in descending order.
+    Ranks candidate workers against a booking request using enhanced Fair Balancing Score (Fi)
+    and Phase 8 Machine Learning Hybrid Ranking (45% Rule Score + 35% ML Suitability + 20% Fairness).
+    Returns candidates sorted by total hybrid score in descending order.
     """
+    from app.ml.inference import predict_worker_suitability
+    from app.ml.fallback import compute_hybrid_matching_score
+
     active_counts = worker_active_counts or {}
     monthly_counts = worker_monthly_counts or {}
     scored_candidates = []
+
+    b_ctx = booking_context or {}
+    b_dict = {
+        "service_name": requested_skill,
+        "service_type": requested_skill,
+        "skill": requested_skill,
+        "is_emergency": is_emergency,
+        "amount": b_ctx.get("amount") or b_ctx.get("final_amount") or 350.0,
+        "created_at": b_ctx.get("created_at")
+    }
 
     for worker in available_workers:
         worker_id = str(worker.get("id"))
@@ -225,6 +240,24 @@ def rank_workers_for_booking(
             is_emergency=is_emergency
         )
 
+        # ML Phase 8 Suitability Inference
+        dist_km = score_res["distance_km"]
+        ml_res = predict_worker_suitability(
+            worker=worker,
+            booking=b_dict,
+            distance_km=dist_km,
+            active_workload=active_cnt
+        )
+
+        # Compute Transparent Hybrid Score
+        hybrid_res = compute_hybrid_matching_score(
+            rule_score=score_res["total_score"],
+            ml_suitability=ml_res.get("suitability_score", 0.5),
+            fairness_points=score_res["fairness_points"],
+            confidence=ml_res.get("confidence", 0.85),
+            fallback_forced=ml_res.get("is_fallback", False)
+        )
+
         user_info = worker.get("users") or {}
         coop_info = worker.get("cooperatives") or {}
 
@@ -241,17 +274,27 @@ def rank_workers_for_booking(
             "hourly_rate": float(worker.get("hourly_rate") or 350.0),
             "verified_status": bool(worker.get("verified_status", True)),
             "availability": bool(worker.get("availability", True)),
-            "distance_km": score_res["distance_km"],
+            "distance_km": dist_km,
             "current_active_bookings": active_cnt,
             "monthly_jobs_completed": monthly_cnt,
-            "score": score_res["total_score"],
+            "score": hybrid_res["hybrid_score"],
+            "hybrid_score": hybrid_res["hybrid_score"],
+            "rule_score": hybrid_res["rule_score"],
+            "ml_score": hybrid_res["ml_score"],
+            "ml_confidence": hybrid_res["confidence"],
+            "ml_version": ml_res.get("model_version", "worker-ranking-v1"),
+            "fallback_used": hybrid_res["fallback_used"],
+            "fallback_reason": hybrid_res.get("fallback_reason"),
             "breakdown": {
                 "distance_points": score_res["distance_points"],
                 "rating_points": score_res["rating_points"],
                 "fairness_points": score_res["fairness_points"],
                 "coop_boost_points": score_res["coop_boost_points"],
                 "experience_points": score_res["experience_points"],
-                "workload_penalty": score_res["workload_penalty"]
+                "workload_penalty": score_res["workload_penalty"],
+                "hybrid_rule_weight": "45%",
+                "hybrid_ml_weight": "35%",
+                "hybrid_fairness_weight": "20%"
             }
         })
 
@@ -345,6 +388,14 @@ def allocate_workers_for_booking(
             "audit_logs": audit_logs
         }
 
+    booking_ctx = {
+        "booking_id": booking_id,
+        "service_name": requested_skill,
+        "is_emergency": is_emergency,
+        "latitude": customer_lat,
+        "longitude": customer_lng
+    }
+
     ranked = rank_workers_for_booking(
         requested_skill=requested_skill,
         request_lat=customer_lat,
@@ -352,14 +403,22 @@ def allocate_workers_for_booking(
         available_workers=eligible_workers,
         worker_active_counts=worker_active_counts,
         worker_monthly_counts=worker_monthly_counts,
-        is_emergency=is_emergency
+        is_emergency=is_emergency,
+        booking_context=booking_ctx
     )
 
-    # Attach calculated scores to eligible audit logs
-    score_map = {r["worker_id"]: r["score"] for r in ranked}
+    # Attach calculated scores & ML telemetry to eligible audit logs
+    candidate_map = {r["worker_id"]: r for r in ranked}
     for log in audit_logs:
-        if log["is_eligible"] and log["worker_id"] in score_map:
-            log["matching_score"] = score_map[log["worker_id"]]
+        if log["is_eligible"] and log["worker_id"] in candidate_map:
+            c_info = candidate_map[log["worker_id"]]
+            log["matching_score"] = c_info["score"]
+            log["hybrid_score"] = c_info["hybrid_score"]
+            log["rule_score"] = c_info["rule_score"]
+            log["ml_score"] = c_info["ml_score"]
+            log["ml_confidence"] = c_info["ml_confidence"]
+            log["ml_version"] = c_info["ml_version"]
+            log["fallback_used"] = c_info["fallback_used"]
 
     # Stage 3: Auto-select required worker count
     allocated_candidates = ranked[:required_worker_count]
@@ -375,6 +434,12 @@ def allocate_workers_for_booking(
             "assigned_at": datetime.utcnow(),
             "distance_km": c["distance_km"],
             "matching_score": c["score"],
+            "hybrid_score": c["hybrid_score"],
+            "rule_score": c["rule_score"],
+            "ml_score": c["ml_score"],
+            "ml_confidence": c["ml_confidence"],
+            "ml_version": c["ml_version"],
+            "fallback_used": c["fallback_used"],
             "assignment_sequence": idx + 1,
             "worker_name": c["name"],
             "worker_phone": c["phone"],

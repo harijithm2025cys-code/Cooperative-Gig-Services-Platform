@@ -319,3 +319,8 @@ def record_admin_audit(
     }
     _ADMIN_AUDIT_LOGS.insert(0, entry)
     return entry
+
+# -------------------------------------------------------------------------
+# Shared In-Memory Complaints / Disputes Registry
+# -------------------------------------------------------------------------
+_COMPLAINTS_BY_ID: Dict[str, Dict[str, Any]] = {}

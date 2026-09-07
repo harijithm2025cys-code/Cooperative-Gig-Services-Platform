@@ -16,10 +16,10 @@ from app.models.complaint import (
 from app.services.payment_service import PaymentService, _PAYMENTS_BY_BOOKING_ID
 from app.services.matching import _BOOKINGS_BY_ID
 from app.services.event_service import EventService
+from app.db.in_memory_store import _COMPLAINTS_BY_ID
 
 logger = logging.getLogger("complaints_router")
 
-_COMPLAINTS_BY_ID: Dict[str, Dict[str, Any]] = {}
 _COMPLAINTS_BY_BOOKING: Dict[str, List[Dict[str, Any]]] = {}
 
 router = APIRouter(prefix="/complaints", tags=["Complaints & Disputes"])

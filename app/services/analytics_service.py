@@ -20,6 +20,7 @@ from app.db.in_memory_store import (
     _WORKERS_BY_ID,
     _SERVICES_BY_ID,
     _ADMIN_AUDIT_LOGS,
+    _COMPLAINTS_BY_ID,
     record_admin_audit
 )
 from app.services.matching import (
@@ -30,7 +31,6 @@ from app.services.matching import (
     _AUDIT_LOGS_BY_BOOKING,
     haversine_distance
 )
-from app.routes.complaints import _COMPLAINTS_BY_ID
 from app.services.payment_service import (
     _PAYMENTS_BY_ID,
     _PAYMENTS_BY_BOOKING_ID,
