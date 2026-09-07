@@ -9,3 +9,11 @@ venv/
 .coverage
 htmlcov/
 *.log
+.env
+.env.*
+*.pem
+*.key
+*.crt
+service_account.json
+credentials.json
+private_key.json

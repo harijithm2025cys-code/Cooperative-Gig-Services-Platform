@@ -356,6 +356,30 @@ def get_worker_assignments(
             ]
         }
 
+def _check_worker_authorization(worker_id: str, current_user: dict, db: Optional[Client] = None) -> None:
+    """
+    IDOR Security Check:
+    Ensures that only the authenticated worker, Association Head, or Super Admin
+    can perform lifecycle actions on worker assignments and profiles.
+    """
+    user_role = (current_user.get("role") or current_user.get("token_role") or "").lower()
+    if user_role in ("super_admin", "admin", "cooperative_association_head"):
+        return
+    user_id = str(current_user.get("id"))
+    if str(worker_id) == user_id or str(current_user.get("worker_id")) == str(worker_id):
+        return
+    if db:
+        try:
+            w_res = db.table("workers").select("user_id").eq("id", worker_id).execute()
+            if w_res.data and str(w_res.data[0].get("user_id")) == user_id:
+                return
+        except Exception:
+            pass
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Access denied. You are not authorized to perform actions for this specialist."
+    )
+
 def _check_booking_paid(booking_id: Optional[str], db: Client) -> None:
     """
     CRITICAL BUSINESS RULE (Phase 5):
@@ -394,6 +418,7 @@ def accept_assignment(
     Transitions assignment to ACCEPTED and booking to accepted.
     Emits real-time event and customer notification.
     """
+    _check_worker_authorization(worker_id, current_user, db)
     from datetime import datetime
     from app.services.matching import update_assignment_status_in_memory, get_assignments_for_booking, _ASSIGNMENTS_BY_ID
     from app.services.event_service import event_service
@@ -477,6 +502,7 @@ def reject_assignment(
     Worker declines an automatic gig assignment.
     Transitions assignment to REJECTED and triggers automatic reallocation to next candidate.
     """
+    _check_worker_authorization(worker_id, current_user, db)
     from datetime import datetime
     from app.services.matching import (
         update_assignment_status_in_memory,
@@ -566,6 +592,7 @@ def start_worker_journey(
     Enforces sequential status check (must be ACCEPTED).
     Transitions assignment and booking to ON_THE_WAY.
     """
+    _check_worker_authorization(worker_id, current_user, db)
     from datetime import datetime
     from app.services.matching import _ASSIGNMENTS_BY_ID, update_assignment_status_in_memory
     from app.services.event_service import event_service
@@ -625,6 +652,7 @@ def worker_arrived_at_location(
     Enforces sequential status check (must be ON_THE_WAY).
     Transitions assignment and booking to ARRIVED.
     """
+    _check_worker_authorization(worker_id, current_user, db)
     from app.services.matching import _ASSIGNMENTS_BY_ID, update_assignment_status_in_memory
     from app.services.event_service import event_service
 
@@ -683,6 +711,7 @@ def start_worker_service(
     Enforces sequential status check (must be ARRIVED or verified_checkin).
     Transitions assignment and booking to IN_PROGRESS.
     """
+    _check_worker_authorization(worker_id, current_user, db)
     from datetime import datetime
     from app.services.matching import _ASSIGNMENTS_BY_ID, update_assignment_status_in_memory
     from app.services.event_service import event_service
@@ -749,15 +778,11 @@ def complete_worker_service(
     generates secure 6-digit customer inspection OTP, and notifies customer.
     Worker response DOES NOT expose the OTP.
     """
+    _check_worker_authorization(worker_id, current_user, db)
     from datetime import datetime, timezone
     from app.services.matching import _ASSIGNMENTS_BY_ID, _BOOKINGS_BY_ID, update_assignment_status_in_memory
     from app.services.event_service import event_service
     from app.services.otp_service import CompletionOtpService
-
-    # Validate worker authorization
-    if current_user.get("role") in ("cooperative_worker", "independent_worker"):
-        if str(current_user.get("id")) != str(worker_id) and str(current_user.get("worker_id")) != str(worker_id):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized worker assignment.")
 
     asgn = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
     curr_status = (asgn.get("status") if asgn else "IN_PROGRESS").upper()
@@ -823,6 +848,7 @@ def verify_worker_completion_otp(
     Enforces attempt limits, 15-min expiry, single-use, and worker authorization.
     Transitions booking to COMPLETED and marks settlement_status = 'ELIGIBLE'.
     """
+    _check_worker_authorization(worker_id, current_user, db)
     from datetime import datetime, timezone
     from app.services.otp_service import CompletionOtpService
     from app.services.matching import _BOOKINGS_BY_ID

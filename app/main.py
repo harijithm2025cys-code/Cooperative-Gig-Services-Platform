@@ -30,6 +30,9 @@ from app.routes import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cooperative_gig_platform")
 
+import time
+import uuid
+
 def create_application() -> FastAPI:
     application = FastAPI(
         title=settings.PROJECT_NAME,
@@ -45,11 +48,26 @@ def create_application() -> FastAPI:
     # ----------------------------------------------------------------------
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # Open for mobile / frontend prototypes
+        allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # ----------------------------------------------------------------------
+    # Request ID & Performance Timing Middleware
+    # ----------------------------------------------------------------------
+    @application.middleware("http")
+    async def request_id_and_timing_middleware(request: Request, call_next):
+        req_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        start_time = time.perf_counter()
+        
+        response = await call_next(request)
+        
+        process_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        response.headers["X-Request-ID"] = req_id
+        response.headers["X-Response-Time-Ms"] = str(process_time_ms)
+        return response
 
     # ----------------------------------------------------------------------
     # Exception Handlers
@@ -82,13 +100,15 @@ def create_application() -> FastAPI:
     @application.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
         logger.error(f"Unhandled exception on {request.url.path}: {str(exc)}", exc_info=True)
+        # Sanitized response: avoid leaking database schemas, connection strings or traces
+        is_dev = settings.ENVIRONMENT == "development"
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
                 "success": False,
                 "status_code": 500,
                 "error": "Internal Server Error",
-                "detail": str(exc),
+                "detail": str(exc) if is_dev else "An unexpected error occurred. Please contact support.",
                 "path": str(request.url.path)
             }
         )

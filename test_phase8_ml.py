@@ -29,7 +29,12 @@ current_test_user = {"role": "customer", "id": "u_test_1", "cooperative_id": "co
 def mock_get_current_user():
     return current_test_user
 
-app.dependency_overrides[get_current_user] = mock_get_current_user
+@pytest.fixture(autouse=True)
+def setup_and_teardown_overrides():
+    set_test_user("customer", "u_test_1", "coop_north_01")
+    app.dependency_overrides[get_current_user] = mock_get_current_user
+    yield
+    app.dependency_overrides.pop(get_current_user, None)
 
 def set_test_user(role="customer", user_id="u_test_1", coop_id="coop_north_01"):
     current_test_user["role"] = role

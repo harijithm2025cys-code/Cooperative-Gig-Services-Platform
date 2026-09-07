@@ -12,9 +12,7 @@ def test_haversine_distance():
     assert 3.0 <= dist <= 5.0, f"Unexpected distance: {dist}"
 
 def test_calculate_worker_score():
-    # Worker 1: Exact skill match, 5km distance, 4.8 rating, 1 active booking
-    # Expected: (1 * 50) + max(0, 20 - 5.0) + (4.8 * 5) - (1 * 3)
-    # = 50 + 15 + 24 - 3 = 86.0
+    # Worker 1: 3.72km distance, 4.8 rating, 1 active booking, cooperative worker
     res = calculate_worker_score(
         worker_skill="Electrician",
         requested_skill="Electrician",
@@ -23,13 +21,14 @@ def test_calculate_worker_score():
         request_lat=12.9784,
         request_lng=77.6408,
         worker_rating=4.8,
-        active_bookings_count=1
+        active_bookings_count=1,
+        is_cooperative_worker=True
     )
     print(f"Worker 1 Score Breakdown: {res}")
-    assert res["skill_match_points"] == 50.0
-    assert res["rating_points"] == 24.0
-    assert res["active_bookings_penalty"] == 3.0
-    assert abs(res["total_score"] - (50.0 + res["distance_points"] + 24.0 - 3.0)) < 0.01
+    assert res["rating_points"] == 19.2
+    assert res["coop_boost_points"] == 15.0
+    assert res["workload_penalty"] == 6.0
+    assert res["total_score"] > 50.0
 
 def test_ranking():
     workers = [

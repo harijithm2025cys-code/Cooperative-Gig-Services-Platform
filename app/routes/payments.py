@@ -246,4 +246,17 @@ def get_payment_details(
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment record not found.")
 
+    # IDOR Security Check: Only the paying customer, Association Head, or Super Admin may view payment details
+    user_id = current_user.get("id")
+    user_role = (current_user.get("role") or current_user.get("token_role") or "customer").lower()
+    
+    if user_role not in ("super_admin", "admin", "cooperative_association_head"):
+        pay_cust_id = record.get("customer_id")
+        if pay_cust_id and str(pay_cust_id) != str(user_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied. You are not authorized to view this payment record."
+            )
+
     return PaymentDetailResponse(**record)
+

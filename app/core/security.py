@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any, Union
+from app.config import settings
 
 try:
     from jose import jwt, JWTError
