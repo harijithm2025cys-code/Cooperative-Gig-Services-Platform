@@ -1,11 +1,18 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any, Union
-from jose import jwt, JWTError
-from passlib.context import CryptContext
-from app.config import settings
 
-# Password hashing context
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+try:
+    from jose import jwt, JWTError
+except ImportError:
+    import jwt
+    class JWTError(Exception):
+        pass
+
+try:
+    from passlib.context import CryptContext
+    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+except ImportError:
+    pwd_context = None
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verifies a plain password against the stored hash or fallback."""

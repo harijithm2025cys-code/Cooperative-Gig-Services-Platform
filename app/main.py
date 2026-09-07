@@ -15,6 +15,8 @@ from app.routes import (
     ratings_router,
     admin_router,
     verification_router,
+    tariffs_router,
+    bulk_bookings_router,
 )
 
 # Logging configuration
@@ -95,6 +97,8 @@ def create_application() -> FastAPI:
     application.include_router(ratings_router)
     application.include_router(admin_router)
     application.include_router(verification_router)
+    application.include_router(tariffs_router)
+    application.include_router(bulk_bookings_router)
 
     return application
 

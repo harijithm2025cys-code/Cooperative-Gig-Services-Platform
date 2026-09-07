@@ -31,15 +31,19 @@ def calculate_worker_score(
     request_lat: Optional[float],
     request_lng: Optional[float],
     worker_rating: float = 0.0,
-    active_bookings_count: int = 0
+    active_bookings_count: int = 0,
+    is_cooperative_worker: bool = True,
+    monthly_jobs_completed: int = 0,
+    experience_years: int = 2,
+    is_emergency: bool = False
 ) -> Dict[str, Any]:
     """
     Calculate the multi-factor weighted match score for a worker candidate.
     
     Formula:
-        Score = (skill_match * 50) + max(0, 20 - distance_km) + (rating * 5) - (active_bookings * 3)
-    
-    Returns a dict containing the individual point components and total score.
+        Score = SkillMatch(50) + DistanceScore(20-30) + RatingScore(25)
+                + FairWorkloadBalancing(Fi, 25) + CoopPriority(15) + Experience(10)
+                - ActiveBookingsPenalty(count * 4)
     """
     # 1. Skill Match (50 points maximum)
     skill_match_flag = 0
@@ -51,37 +55,63 @@ def calculate_worker_score(
     
     skill_points = 50.0 * skill_match_flag
 
-    # 2. Distance Score (20 points maximum, 0 if distance >= 20km)
+    # 2. Distance Score (20 points normal, 30 points if emergency)
+    max_dist_pts = 30.0 if is_emergency else 20.0
     if (worker_lat is not None and worker_lng is not None and 
         request_lat is not None and request_lng is not None):
         distance_km = haversine_distance(request_lat, request_lng, worker_lat, worker_lng)
-        distance_points = max(0.0, 20.0 - distance_km)
+        distance_points = max(0.0, max_dist_pts - distance_km)
     else:
         distance_km = 999.0
         distance_points = 0.0
 
     # 3. Rating Score (Rating * 5 points, max 25 for 5.0 rating)
     rating_val = float(worker_rating) if worker_rating is not None else 0.0
-    # Clamping rating between 0 and 5
     rating_val = max(0.0, min(5.0, rating_val))
     rating_points = rating_val * 5.0
 
-    # 4. Active Bookings Penalty (-(active_bookings * 3) points)
-    active_count = max(0, int(active_bookings_count or 0))
-    active_penalty = active_count * 3.0
+    # 4. Fair Workload Balancing Factor (Fi) - Up to 25 points
+    # Prevents monopoly by allocating higher scores to under-dispatched workers
+    # If a worker has 0 jobs this month, Fi = 25.0 points. Decreases gradually as jobs increase.
+    jobs_done = max(0, int(monthly_jobs_completed or 0))
+    fairness_points = max(0.0, 25.0 - (jobs_done * 2.5))
 
-    # Total Score
-    total_score = skill_points + distance_points + rating_points - active_penalty
+    # 5. Cooperative Member Priority Boost (15 points)
+    coop_boost_points = 15.0 if is_cooperative_worker else 0.0
+
+    # 6. Experience Points (1 point per year, max 10 points)
+    exp = max(0, min(10, int(experience_years or 0)))
+    experience_points = float(exp)
+
+    # 7. Active Bookings Penalty (-(active_bookings * 4) points)
+    active_count = max(0, int(active_bookings_count or 0))
+    active_penalty = active_count * 4.0
+
+    # Total Multi-Factor Score
+    total_score = (
+        skill_points +
+        distance_points +
+        rating_points +
+        fairness_points +
+        coop_boost_points +
+        experience_points -
+        active_penalty
+    )
 
     return {
         "skill_match_points": round(skill_points, 2),
         "distance_points": round(distance_points, 2),
         "rating_points": round(rating_points, 2),
+        "fairness_points": round(fairness_points, 2),
+        "coop_boost_points": round(coop_boost_points, 2),
+        "experience_points": round(experience_points, 2),
         "active_bookings_penalty": round(active_penalty, 2),
         "total_score": round(total_score, 2),
         "distance_km": distance_km,
         "is_skill_match": bool(skill_match_flag),
-        "active_bookings_count": active_count
+        "active_bookings_count": active_count,
+        "monthly_jobs_completed": jobs_done,
+        "is_cooperative_worker": is_cooperative_worker
     }
 
 def rank_workers_for_booking(
@@ -89,13 +119,16 @@ def rank_workers_for_booking(
     request_lat: float,
     request_lng: float,
     available_workers: List[Dict[str, Any]],
-    worker_active_counts: Optional[Dict[str, int]] = None
+    worker_active_counts: Optional[Dict[str, int]] = None,
+    worker_monthly_counts: Optional[Dict[str, int]] = None,
+    is_emergency: bool = False
 ) -> List[Dict[str, Any]]:
     """
-    Ranks a list of candidate workers against a booking request using calculate_worker_score.
-    Returns the candidates sorted by total score in descending order.
+    Ranks candidate workers against a booking request using enhanced Fair Balancing Score (Fi).
+    Returns candidates sorted by total score in descending order.
     """
     active_counts = worker_active_counts or {}
+    monthly_counts = worker_monthly_counts or {}
     scored_candidates = []
 
     for worker in available_workers:
@@ -104,7 +137,14 @@ def rank_workers_for_booking(
         w_lat = worker.get("latitude")
         w_lng = worker.get("longitude")
         w_rating = float(worker.get("rating") or 0.0)
+        w_exp = int(worker.get("experience_years") or 2)
         active_cnt = active_counts.get(worker_id, 0)
+        monthly_cnt = monthly_counts.get(worker_id, int(worker.get("jobs_completed_this_month") or 0))
+
+        # Check if worker is cooperative member
+        coop_id = worker.get("cooperative_id")
+        w_type = worker.get("worker_type", "cooperative")
+        is_coop = bool(coop_id) and (w_type != "independent")
 
         score_res = calculate_worker_score(
             worker_skill=w_skill,
@@ -114,7 +154,11 @@ def rank_workers_for_booking(
             request_lat=request_lat,
             request_lng=request_lng,
             worker_rating=w_rating,
-            active_bookings_count=active_cnt
+            active_bookings_count=active_cnt,
+            is_cooperative_worker=is_coop,
+            monthly_jobs_completed=monthly_cnt,
+            experience_years=w_exp,
+            is_emergency=is_emergency
         )
 
         user_info = worker.get("users") or {}
@@ -126,23 +170,28 @@ def rank_workers_for_booking(
             "name": user_info.get("name") or user_info.get("email", "Worker"),
             "phone": user_info.get("phone"),
             "skill": w_skill,
-            "cooperative_id": worker.get("cooperative_id"),
+            "cooperative_id": coop_id,
             "cooperative_name": coop_info.get("name") if isinstance(coop_info, dict) else None,
+            "worker_type": w_type,
             "rating": w_rating,
-            "verified_status": bool(worker.get("verified_status", False)),
+            "hourly_rate": float(worker.get("hourly_rate") or 350.0),
+            "verified_status": bool(worker.get("verified_status", True)),
             "availability": bool(worker.get("availability", True)),
             "distance_km": score_res["distance_km"],
             "current_active_bookings": active_cnt,
+            "monthly_jobs_completed": monthly_cnt,
             "score": score_res["total_score"],
             "breakdown": {
                 "skill_match_points": score_res["skill_match_points"],
                 "distance_points": score_res["distance_points"],
                 "rating_points": score_res["rating_points"],
-                "active_bookings_penalty": score_res["active_bookings_penalty"],
-                "total_score": score_res["total_score"]
+                "fairness_points": score_res["fairness_points"],
+                "coop_boost_points": score_res["coop_boost_points"],
+                "experience_points": score_res["experience_points"],
+                "active_bookings_penalty": score_res["active_bookings_penalty"]
             }
         })
 
-    # Sort descending by total score
-    scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+    # Sort descending by final score
+    scored_candidates.sort(key=lambda c: c["score"], reverse=True)
     return scored_candidates

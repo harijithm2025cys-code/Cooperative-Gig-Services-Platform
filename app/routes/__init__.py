@@ -6,6 +6,8 @@ from app.routes.ratings import router as ratings_router
 from app.routes.admin import router as admin_router
 from app.routes.health import router as health_router
 from app.routes.verification import router as verification_router
+from app.routes.tariffs import router as tariffs_router
+from app.routes.bulk_bookings import router as bulk_bookings_router
 
 __all__ = [
     "auth_router",
@@ -16,4 +18,7 @@ __all__ = [
     "admin_router",
     "health_router",
     "verification_router",
+    "tariffs_router",
+    "bulk_bookings_router",
 ]
+

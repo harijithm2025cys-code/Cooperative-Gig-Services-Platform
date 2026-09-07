@@ -29,6 +29,9 @@ class Settings:
     ALGORITHM: str = os.getenv("ALGORITHM", "HS256")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
 
+    # Google Maps Integration Key for Location & Proximity Tracking
+    GOOGLE_MAPS_API_KEY: str = os.getenv("GOOGLE_MAPS_API_KEY", "AIzaSyCo_8I7zNvhpBL2KUYzqCGhueJl0B6Gl6Y")
+
     def validate_config(self):
         if not self.SUPABASE_URL or not self.SUPABASE_KEY:
             raise ValueError(

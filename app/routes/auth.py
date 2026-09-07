@@ -58,8 +58,14 @@ def register(
 
         profile_id = None
 
-        # If role is household, initialize households table entry
-        if payload.role == "household":
+        profile_id = None
+        coop_id = payload.cooperative_id
+        worker_type = None
+
+        norm_role = payload.role.lower()
+
+        # 1. Customer / Household
+        if norm_role in ["customer", "household"]:
             household_row = {
                 "id": str(uuid.uuid4()),
                 "user_id": user_id,
@@ -67,35 +73,99 @@ def register(
                 "latitude": payload.latitude or 12.9716,
                 "longitude": payload.longitude or 77.5946
             }
-            hh_res = db.table("households").insert(household_row).execute()
-            if hh_res.data:
-                profile_id = hh_res.data[0].get("id")
+            try:
+                hh_res = db.table("households").insert(household_row).execute()
+                if hh_res.data:
+                    profile_id = hh_res.data[0].get("id")
+            except Exception:
+                pass
 
-        # If role is worker, initialize workers table entry
-        elif payload.role == "worker":
+        # 2. Cooperative Worker (Belongs to Association, Pre-Verified by Association)
+        elif norm_role in ["cooperative_worker", "worker"] or (payload.worker_type == "cooperative"):
+            worker_type = "cooperative"
             worker_row = {
                 "id": str(uuid.uuid4()),
                 "user_id": user_id,
-                "cooperative_id": payload.cooperative_id,
-                "skill": payload.skill or "Electrician",
+                "cooperative_id": coop_id,
+                "skill": payload.skill or "Specialist",
+                "worker_type": "cooperative",
+                "member_reg_id": payload.member_reg_id or f"COOP-{random_digits()}",
                 "latitude": payload.latitude or 12.9716,
                 "longitude": payload.longitude or 77.5946,
                 "rating": 5.0,
+                # Pre-verified by Association: True
                 "is_verified": True,
+                "verified_status": True,
                 "is_available": True,
+                "availability": True,
                 "experience_years": 3
             }
             try:
                 w_res = db.table("workers").insert(worker_row).execute()
+                if w_res.data:
+                    profile_id = w_res.data[0].get("id")
             except Exception:
-                # Fallback for alternative column naming
-                worker_row["availability"] = True
-                worker_row["verified_status"] = True
+                # Omit optional columns if schema varies
+                worker_row.pop("worker_type", None)
+                worker_row.pop("member_reg_id", None)
                 w_res = db.table("workers").insert(worker_row).execute()
-            if w_res.data:
-                profile_id = w_res.data[0].get("id")
+                if w_res.data:
+                    profile_id = w_res.data[0].get("id")
 
-        # Generate JWT Token
+        # 3. Independent Worker (Outside Cooperative Hierarchy, Self-Set Rate)
+        elif norm_role == "independent_worker" or (payload.worker_type == "independent"):
+            worker_type = "independent"
+            worker_row = {
+                "id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "cooperative_id": None,  # Outside co-op hierarchy
+                "skill": payload.skill or "Independent Technician",
+                "worker_type": "independent",
+                "hourly_rate": payload.hourly_rate or 400.0,
+                "latitude": payload.latitude or 12.9716,
+                "longitude": payload.longitude or 77.5946,
+                "rating": 4.5,
+                "is_verified": False,  # Needs independent KYC
+                "verified_status": False,
+                "is_available": True,
+                "availability": True,
+                "experience_years": 2
+            }
+            try:
+                w_res = db.table("workers").insert(worker_row).execute()
+                if w_res.data:
+                    profile_id = w_res.data[0].get("id")
+            except Exception:
+                worker_row.pop("worker_type", None)
+                worker_row.pop("hourly_rate", None)
+                w_res = db.table("workers").insert(worker_row).execute()
+                if w_res.data:
+                    profile_id = w_res.data[0].get("id")
+
+        # 4. Cooperative Association Head
+        elif norm_role in ["cooperative_association_head", "admin"]:
+            if payload.society_name:
+                # Optionally link or create cooperative association entry
+                coop_row = {
+                    "id": str(uuid.uuid4()),
+                    "name": payload.society_name,
+                    "district": payload.district or "Central District",
+                    "state": "Tamil Nadu",
+                    "verified": True
+                }
+                try:
+                    c_res = db.table("cooperatives").insert(coop_row).execute()
+                    if c_res.data:
+                        coop_id = c_res.data[0].get("id")
+                except Exception:
+                    pass
+
+        # 5. Super Admin (Federation Level)
+        elif norm_role == "super_admin":
+            # Federation wide access
+            pass
+
+        # Generate JWT Token with full role claims
         access_token = create_access_token(
             subject=user_id,
             role=payload.role,
@@ -108,7 +178,9 @@ def register(
             role=payload.role,
             user_id=user_id,
             email=payload.email,
-            profile_id=profile_id
+            profile_id=profile_id,
+            cooperative_id=coop_id,
+            worker_type=worker_type
         )
 
     except HTTPException:

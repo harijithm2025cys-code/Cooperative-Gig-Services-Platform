@@ -9,11 +9,15 @@ class WorkerResponse(BaseModel):
     id: str
     user_id: str
     cooperative_id: Optional[str] = None
+    worker_type: Optional[str] = "cooperative"  # "cooperative" or "independent"
+    member_reg_id: Optional[str] = None
     skill: str
     service_area: Optional[str] = None
     rating: float = 0.0
     availability: bool = True
     verified_status: bool = False
+    is_pre_verified_by_association: bool = True
+    hourly_rate: Optional[float] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     name: Optional[str] = None
@@ -27,11 +31,15 @@ class WorkerDetailResponse(BaseModel):
     id: str
     user_id: str
     cooperative_id: Optional[str] = None
+    worker_type: Optional[str] = "cooperative"
+    member_reg_id: Optional[str] = None
     skill: str
     service_area: Optional[str] = None
     rating: float = 0.0
     availability: bool = True
     verified_status: bool = False
+    is_pre_verified_by_association: bool = True
+    hourly_rate: Optional[float] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     user: Optional[Dict[str, Any]] = None
