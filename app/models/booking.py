@@ -24,6 +24,7 @@ class BookingCreate(BaseModel):
     household_id: Optional[str] = Field(None, description="Household ID. Inferred from current user if omitted.")
     service_id: str = Field(..., description="Service ID requested")
     worker_id: Optional[str] = Field(None, description="Optional preferred worker ID. If omitted, matching engine will assign.")
+    required_worker_count: int = Field(default=1, ge=1, le=20, description="Number of workers required for this service")
     scheduled_time: Optional[datetime] = Field(None, description="Scheduled time for service")
     latitude: Optional[float] = Field(None, description="Service location latitude")
     longitude: Optional[float] = Field(None, description="Service location longitude")
@@ -84,6 +85,9 @@ class BookingResponse(BaseModel):
     worker_id: Optional[str] = None
     service_id: str
     status: str
+    required_worker_count: int = 1
+    assigned_worker_count: int = 0
+    allocation_status: str = "PENDING"
     scheduled_time: Optional[datetime] = None
     created_at: Optional[datetime] = None
     check_in_time: Optional[datetime] = None
@@ -104,6 +108,7 @@ class BookingResponse(BaseModel):
     worker_live_lng: Optional[float] = None
     worker_last_seen: Optional[datetime] = None
     
+    assignments: Optional[List[Dict[str, Any]]] = None
     household: Optional[Dict[str, Any]] = None
     worker: Optional[Dict[str, Any]] = None
     service: Optional[Dict[str, Any]] = None

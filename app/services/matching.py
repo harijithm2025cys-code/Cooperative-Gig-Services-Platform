@@ -1,27 +1,106 @@
 import math
-from typing import List, Dict, Any, Optional
+import uuid
+from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime
 
-def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+def haversine_distance(lat1: Optional[float], lon1: Optional[float], lat2: Optional[float], lon2: Optional[float]) -> float:
     """
-    Calculate the great-circle distance between two points on the Earth in kilometers.
+    Calculate the great-circle distance between two points on Earth in kilometers.
     Uses the standard Haversine formula.
     """
     if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
-        return 999.0  # Return large distance if coordinates are missing
+        return 999.0
 
-    # Earth radius in kilometers
-    R = 6371.0
-    
+    R = 6371.0  # Earth radius in kilometers
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     delta_phi = math.radians(lat2 - lat1)
     delta_lambda = math.radians(lon2 - lon1)
-    
+
     a = (math.sin(delta_phi / 2.0) ** 2 +
          math.cos(phi1) * math.cos(phi2) * (math.sin(delta_lambda / 2.0) ** 2))
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
-    
     return round(R * c, 2)
+
+def evaluate_worker_eligibility(
+    worker: Dict[str, Any],
+    requested_skill: str,
+    target_cooperative_id: Optional[str] = None,
+    required_certification: Optional[str] = None,
+    customer_lat: Optional[float] = None,
+    customer_lng: Optional[float] = None,
+    max_service_radius_km: float = 25.0,
+    active_conflicted_worker_ids: Optional[set] = None
+) -> Tuple[bool, Optional[str], float]:
+    """
+    Stage 1 Hard Constraint Filters.
+    Evaluates whether a worker candidate meets strict mandatory eligibility criteria.
+    Returns: (is_eligible: bool, rejection_reason: Optional[str], distance_km: float)
+    
+    Hard Filters:
+    1. Active Status (worker not suspended or disabled)
+    2. Cooperative Society Membership match (if targeted)
+    3. Mandatory Skill match
+    4. Mandatory Certification (if service requires special license)
+    5. Operational Availability Status ('available' vs 'unavailable'/'working'/'leave')
+    6. Service Area / Distance Radius check
+    7. Schedule / Overlapping Booking Conflict check
+    """
+    active_conflicts = active_conflicted_worker_ids or set()
+    worker_id = str(worker.get("id"))
+
+    # 1. Active Worker Check
+    if worker.get("is_active") is False:
+        return False, "worker_inactive", 999.0
+
+    # 2. Cooperative Match (if specific cooperative requested)
+    w_coop_id = worker.get("cooperative_id")
+    w_type = worker.get("worker_type", "cooperative")
+    if target_cooperative_id and w_coop_id:
+        if str(w_coop_id) != str(target_cooperative_id):
+            return False, "cooperative_mismatch", 999.0
+    elif target_cooperative_id and not w_coop_id:
+        return False, "independent_worker_excluded_from_cooperative_request", 999.0
+
+    # 3. Mandatory Skill Match
+    w_skill = (worker.get("skill") or "").strip().lower()
+    r_skill = (requested_skill or "").strip().lower()
+    if not (r_skill in w_skill or w_skill in r_skill):
+        return False, "skill_mismatch", 999.0
+
+    # 4. Mandatory Certification Check (if service demands certification)
+    if required_certification:
+        w_certs = [c.lower() for c in (worker.get("certifications") or [])]
+        req_cert = required_certification.strip().lower()
+        if not any(req_cert in c or c in req_cert for c in w_certs):
+            return False, "missing_required_certification", 999.0
+
+    # 5. Availability Status Check
+    avail_status = (worker.get("availability_status") or "available").lower()
+    is_avail_bool = worker.get("is_available")
+    if is_avail_bool is None:
+        is_avail_bool = worker.get("availability", True)
+
+    if not is_avail_bool or avail_status != "available":
+        return False, f"worker_unavailable_{avail_status}", 999.0
+
+    # 6. Schedule / Booking Conflict Check
+    if worker_id in active_conflicts:
+        return False, "booking_schedule_conflict", 999.0
+
+    # 7. Service Area / Proximity Radius Check
+    w_lat = worker.get("latitude")
+    w_lng = worker.get("longitude")
+    service_radius = float(worker.get("service_radius_km") or max_service_radius_km)
+
+    if customer_lat is not None and customer_lng is not None and w_lat is not None and w_lng is not None:
+        dist_km = haversine_distance(customer_lat, customer_lng, float(w_lat), float(w_lng))
+        if dist_km > service_radius:
+            return False, "outside_service_area", dist_km
+    else:
+        dist_km = 999.0
+
+    return True, None, dist_km
 
 def calculate_worker_score(
     worker_skill: Optional[str],
@@ -38,25 +117,15 @@ def calculate_worker_score(
     is_emergency: bool = False
 ) -> Dict[str, Any]:
     """
-    Calculate the multi-factor weighted match score for a worker candidate.
+    Stage 2 Deterministic Multi-Factor Ranking Score.
+    Applied ONLY to candidate workers who have passed Stage 1 hard eligibility filters.
     
     Formula:
-        Score = SkillMatch(50) + DistanceScore(20-30) + RatingScore(25)
-                + FairWorkloadBalancing(Fi, 25) + CoopPriority(15) + Experience(10)
-                - ActiveBookingsPenalty(count * 4)
+        Score = DistanceScore(25-35) + RatingScore(20) + FairnessMonthly(Fi, 25)
+                + CoopPriority(15) + Experience(10) - ActiveWorkloadPenalty(count * 6)
     """
-    # 1. Skill Match (50 points maximum)
-    skill_match_flag = 0
-    if worker_skill and requested_skill:
-        ws = worker_skill.strip().lower()
-        rs = requested_skill.strip().lower()
-        if rs in ws or ws in rs:
-            skill_match_flag = 1
-    
-    skill_points = 50.0 * skill_match_flag
-
-    # 2. Distance Score (20 points normal, 30 points if emergency)
-    max_dist_pts = 30.0 if is_emergency else 20.0
+    # 1. Distance Score (max 25 normal, max 35 if emergency)
+    max_dist_pts = 35.0 if is_emergency else 25.0
     if (worker_lat is not None and worker_lng is not None and 
         request_lat is not None and request_lng is not None):
         distance_km = haversine_distance(request_lat, request_lng, worker_lat, worker_lng)
@@ -65,50 +134,46 @@ def calculate_worker_score(
         distance_km = 999.0
         distance_points = 0.0
 
-    # 3. Rating Score (Rating * 5 points, max 25 for 5.0 rating)
+    # 2. Rating Score (Rating * 4.0 points, max 20 for 5.0 rating)
     rating_val = float(worker_rating) if worker_rating is not None else 0.0
     rating_val = max(0.0, min(5.0, rating_val))
-    rating_points = rating_val * 5.0
+    rating_points = rating_val * 4.0
 
-    # 4. Fair Workload Balancing Factor (Fi) - Up to 25 points
-    # Prevents monopoly by allocating higher scores to under-dispatched workers
-    # If a worker has 0 jobs this month, Fi = 25.0 points. Decreases gradually as jobs increase.
+    # 3. Fair Workload Balancing Factor (Fi) - Up to 25 points
+    # Balances monthly earnings: workers with fewer jobs this month gain up to +25 score
     jobs_done = max(0, int(monthly_jobs_completed or 0))
     fairness_points = max(0.0, 25.0 - (jobs_done * 2.5))
 
-    # 5. Cooperative Member Priority Boost (15 points)
+    # 4. Current Workload Penalty (-(active_assignments * 6) points)
+    # Immediate concurrency fairness: workers with 0 active jobs rank above workers with active jobs
+    active_count = max(0, int(active_bookings_count or 0))
+    workload_penalty = active_count * 6.0
+
+    # 5. Cooperative Priority Boost (15 points)
     coop_boost_points = 15.0 if is_cooperative_worker else 0.0
 
     # 6. Experience Points (1 point per year, max 10 points)
     exp = max(0, min(10, int(experience_years or 0)))
     experience_points = float(exp)
 
-    # 7. Active Bookings Penalty (-(active_bookings * 4) points)
-    active_count = max(0, int(active_bookings_count or 0))
-    active_penalty = active_count * 4.0
-
-    # Total Multi-Factor Score
     total_score = (
-        skill_points +
         distance_points +
         rating_points +
         fairness_points +
         coop_boost_points +
         experience_points -
-        active_penalty
+        workload_penalty
     )
 
     return {
-        "skill_match_points": round(skill_points, 2),
         "distance_points": round(distance_points, 2),
         "rating_points": round(rating_points, 2),
         "fairness_points": round(fairness_points, 2),
         "coop_boost_points": round(coop_boost_points, 2),
         "experience_points": round(experience_points, 2),
-        "active_bookings_penalty": round(active_penalty, 2),
+        "workload_penalty": round(workload_penalty, 2),
         "total_score": round(total_score, 2),
         "distance_km": distance_km,
-        "is_skill_match": bool(skill_match_flag),
         "active_bookings_count": active_count,
         "monthly_jobs_completed": jobs_done,
         "is_cooperative_worker": is_cooperative_worker
@@ -141,7 +206,6 @@ def rank_workers_for_booking(
         active_cnt = active_counts.get(worker_id, 0)
         monthly_cnt = monthly_counts.get(worker_id, int(worker.get("jobs_completed_this_month") or 0))
 
-        # Check if worker is cooperative member
         coop_id = worker.get("cooperative_id")
         w_type = worker.get("worker_type", "cooperative")
         is_coop = bool(coop_id) and (w_type != "independent")
@@ -182,16 +246,200 @@ def rank_workers_for_booking(
             "monthly_jobs_completed": monthly_cnt,
             "score": score_res["total_score"],
             "breakdown": {
-                "skill_match_points": score_res["skill_match_points"],
                 "distance_points": score_res["distance_points"],
                 "rating_points": score_res["rating_points"],
                 "fairness_points": score_res["fairness_points"],
                 "coop_boost_points": score_res["coop_boost_points"],
                 "experience_points": score_res["experience_points"],
-                "active_bookings_penalty": score_res["active_bookings_penalty"]
+                "workload_penalty": score_res["workload_penalty"]
             }
         })
 
-    # Sort descending by final score
     scored_candidates.sort(key=lambda c: c["score"], reverse=True)
     return scored_candidates
+
+def allocate_workers_for_booking(
+    booking_id: str,
+    requested_skill: str,
+    customer_lat: float,
+    customer_lng: float,
+    required_worker_count: int,
+    candidate_workers: List[Dict[str, Any]],
+    target_cooperative_id: Optional[str] = None,
+    required_certification: Optional[str] = None,
+    active_conflicted_worker_ids: Optional[set] = None,
+    worker_active_counts: Optional[Dict[str, int]] = None,
+    worker_monthly_counts: Optional[Dict[str, int]] = None,
+    is_emergency: bool = False
+) -> Dict[str, Any]:
+    """
+    Phase 3 Complete Two-Stage Matching & Multi-Worker Allocation Pipeline:
+    
+    1. STAGE 1 (Hard Eligibility Filter):
+       - Filters candidate pool by skill, certification, active status, availability, distance, schedule conflicts.
+       - Records audit log entries for all evaluated candidates (both eligible and rejected).
+       
+    2. STAGE 2 (Deterministic Ranking):
+       - Ranks eligible candidates using multi-factor formula (distance + rating + Fi fairness - workload).
+       
+    3. STAGE 3 (Automatic Allocation):
+       - Selects the top N required workers.
+       - Produces assignment records with sequence index and matching metadata.
+       - Determines status: ASSIGNED, PARTIALLY_MATCHED, or NO_ELIGIBLE_WORKER.
+    """
+    eligible_workers = []
+    audit_logs = []
+
+    for worker in candidate_workers:
+        worker_id = str(worker.get("id"))
+        user_info = worker.get("users") or {}
+        w_name = user_info.get("name") or worker.get("name") or "Worker"
+
+        is_eligible, rejection_reason, dist_km = evaluate_worker_eligibility(
+            worker=worker,
+            requested_skill=requested_skill,
+            target_cooperative_id=target_cooperative_id,
+            required_certification=required_certification,
+            customer_lat=customer_lat,
+            customer_lng=customer_lng,
+            active_conflicted_worker_ids=active_conflicted_worker_ids
+        )
+
+        if is_eligible:
+            eligible_workers.append(worker)
+            audit_logs.append({
+                "id": str(uuid.uuid4()),
+                "booking_id": booking_id,
+                "worker_id": worker_id,
+                "worker_name": w_name,
+                "is_eligible": True,
+                "rejection_reason": None,
+                "distance_km": dist_km,
+                "matching_score": 0.0,
+                "created_at": datetime.utcnow()
+            })
+        else:
+            audit_logs.append({
+                "id": str(uuid.uuid4()),
+                "booking_id": booking_id,
+                "worker_id": worker_id,
+                "worker_name": w_name,
+                "is_eligible": False,
+                "rejection_reason": rejection_reason,
+                "distance_km": dist_km if dist_km < 900 else None,
+                "matching_score": 0.0,
+                "created_at": datetime.utcnow()
+            })
+
+    # Stage 2: Rank eligible candidates only
+    if not eligible_workers:
+        record_allocation_assignments(booking_id, [], audit_logs)
+        return {
+            "success": False,
+            "booking_id": booking_id,
+            "allocation_status": "NO_ELIGIBLE_WORKER",
+            "required_worker_count": required_worker_count,
+            "assigned_worker_count": 0,
+            "assigned_workers": [],
+            "explanation": f"No eligible cooperative workers available with skill '{requested_skill}' within service radius.",
+            "audit_logs": audit_logs
+        }
+
+    ranked = rank_workers_for_booking(
+        requested_skill=requested_skill,
+        request_lat=customer_lat,
+        request_lng=customer_lng,
+        available_workers=eligible_workers,
+        worker_active_counts=worker_active_counts,
+        worker_monthly_counts=worker_monthly_counts,
+        is_emergency=is_emergency
+    )
+
+    # Attach calculated scores to eligible audit logs
+    score_map = {r["worker_id"]: r["score"] for r in ranked}
+    for log in audit_logs:
+        if log["is_eligible"] and log["worker_id"] in score_map:
+            log["matching_score"] = score_map[log["worker_id"]]
+
+    # Stage 3: Auto-select required worker count
+    allocated_candidates = ranked[:required_worker_count]
+    assigned_count = len(allocated_candidates)
+
+    assignments = []
+    for idx, c in enumerate(allocated_candidates):
+        assignments.append({
+            "id": str(uuid.uuid4()),
+            "booking_id": booking_id,
+            "worker_id": c["worker_id"],
+            "status": "ASSIGNED",
+            "assigned_at": datetime.utcnow(),
+            "distance_km": c["distance_km"],
+            "matching_score": c["score"],
+            "assignment_sequence": idx + 1,
+            "worker_name": c["name"],
+            "worker_phone": c["phone"],
+            "worker_skill": c["skill"],
+            "cooperative_name": c["cooperative_name"] or "Labour Cooperative Society"
+        })
+
+    if assigned_count >= required_worker_count:
+        status_code = "ASSIGNED"
+        explanation = f"Successfully auto-allocated {assigned_count} of {required_worker_count} requested specialists."
+    else:
+        status_code = "PARTIALLY_MATCHED"
+        explanation = f"Partially allocated {assigned_count} of {required_worker_count} requested specialists. Awaiting additional members."
+
+    record_allocation_assignments(booking_id, assignments, audit_logs)
+
+    return {
+        "success": True,
+        "booking_id": booking_id,
+        "allocation_status": status_code,
+        "required_worker_count": required_worker_count,
+        "assigned_worker_count": assigned_count,
+        "assigned_workers": assignments,
+        "explanation": explanation,
+        "audit_logs": audit_logs
+    }
+
+# ---------------------------------------------------------------------------
+# In-memory assignment and audit log stores (guarantees fast query fallback)
+# ---------------------------------------------------------------------------
+
+_ASSIGNMENTS_BY_BOOKING: Dict[str, List[Dict[str, Any]]] = {}
+_ASSIGNMENTS_BY_WORKER: Dict[str, List[Dict[str, Any]]] = {}
+_ASSIGNMENTS_BY_ID: Dict[str, Dict[str, Any]] = {}
+_AUDIT_LOGS_BY_BOOKING: Dict[str, List[Dict[str, Any]]] = {}
+
+def record_allocation_assignments(booking_id: str, assignments: List[Dict[str, Any]], audit_logs: List[Dict[str, Any]]) -> None:
+    bid = str(booking_id)
+    _ASSIGNMENTS_BY_BOOKING[bid] = assignments
+    for a in assignments:
+        wid = str(a["worker_id"])
+        if wid not in _ASSIGNMENTS_BY_WORKER:
+            _ASSIGNMENTS_BY_WORKER[wid] = []
+        if not any(x.get("id") == a.get("id") for x in _ASSIGNMENTS_BY_WORKER[wid]):
+            _ASSIGNMENTS_BY_WORKER[wid].insert(0, a)
+        _ASSIGNMENTS_BY_ID[str(a.get("id"))] = a
+        
+    _AUDIT_LOGS_BY_BOOKING[bid] = audit_logs
+
+def get_assignments_for_booking(booking_id: str) -> List[Dict[str, Any]]:
+    return _ASSIGNMENTS_BY_BOOKING.get(str(booking_id), [])
+
+def get_assignments_for_worker(worker_id: str, status_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    asgns = _ASSIGNMENTS_BY_WORKER.get(str(worker_id), [])
+    if status_filter:
+        return [a for a in asgns if (a.get("status") or "").upper() == status_filter.upper()]
+    return asgns
+
+def update_assignment_status_in_memory(assignment_id: str, new_status: str) -> Optional[Dict[str, Any]]:
+    aid = str(assignment_id)
+    if aid in _ASSIGNMENTS_BY_ID:
+        _ASSIGNMENTS_BY_ID[aid]["status"] = new_status
+        return _ASSIGNMENTS_BY_ID[aid]
+    return None
+
+def get_audit_logs_for_booking(booking_id: str) -> List[Dict[str, Any]]:
+    return _AUDIT_LOGS_BY_BOOKING.get(str(booking_id), [])
+

@@ -111,6 +111,13 @@ def create_booking(
         srv = srv_check.data[0]
         est_amount = payload.estimated_amount if payload.estimated_amount else srv.get("base_price", 0)
 
+        # Usable Location Validation (Requirement 4: No fabricated GPS, return error if unavailable)
+        if lat is None or lng is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Customer service location coordinates (latitude and longitude) are required for booking and automatic worker allocation. Location coordinates must be provided."
+            )
+
         otp = _generate_otp()
 
         booking_record = {
@@ -120,8 +127,8 @@ def create_booking(
             "service_id": payload.service_id,
             "status": "requested",
             "requested_at": now_iso,
-            "latitude": lat,
-            "longitude": lng,
+            "latitude": float(lat),
+            "longitude": float(lng),
             "address": addr,
             "notes": payload.notes,
             "estimated_amount": est_amount,
@@ -145,12 +152,74 @@ def create_booking(
                                 detail="Failed to record booking in database.")
 
         created_booking = res.data[0]
+
+        # Automatic Worker Allocation Pipeline (Phase 3 Requirement 1, 8, 11)
+        assigned_worker_id = payload.worker_id
+        assigned_count = 1 if payload.worker_id else 0
+        alloc_status = "ASSIGNED" if payload.worker_id else "REQUESTED"
+        final_booking_status = "accepted" if payload.worker_id else "requested"
+        allocated_assignments = []
+
+        if not payload.worker_id:
+            try:
+                from app.services.matching import allocate_workers_for_booking
+                w_res = db.table("workers").select(
+                    "*, users(id, name, email, phone), cooperatives(id, name, district)"
+                ).execute()
+                candidates = w_res.data or []
+
+                active_res = db.table("bookings").select("worker_id").in_(
+                    "status", ["accepted", "worker_enroute", "arrived", "in_progress"]
+                ).not_.is_("worker_id", "null").execute()
+                conflicted_ids = {str(r["worker_id"]) for r in (active_res.data or []) if r.get("worker_id")}
+
+                alloc_res = allocate_workers_for_booking(
+                    booking_id=booking_id,
+                    requested_skill=srv.get("name") or payload.service_id,
+                    customer_lat=float(lat),
+                    customer_lng=float(lng),
+                    required_worker_count=payload.required_worker_count,
+                    candidate_workers=candidates,
+                    active_conflicted_worker_ids=conflicted_ids
+                )
+
+                allocated_assignments = alloc_res.get("assigned_workers", [])
+                assigned_count = alloc_res.get("assigned_worker_count", 0)
+                alloc_status = alloc_res.get("allocation_status", "NO_ELIGIBLE_WORKER")
+
+                if alloc_status == "ASSIGNED":
+                    final_booking_status = "accepted"
+                    assigned_worker_id = allocated_assignments[0]["worker_id"]
+                elif alloc_status == "PARTIALLY_MATCHED":
+                    final_booking_status = "partially_matched"
+                    assigned_worker_id = allocated_assignments[0]["worker_id"] if allocated_assignments else None
+                else:
+                    final_booking_status = "requested"
+                    assigned_worker_id = None
+
+                # Persist allocation result to booking record
+                try:
+                    db.table("bookings").update({
+                        "worker_id": assigned_worker_id,
+                        "status": final_booking_status,
+                        "assigned_worker_count": assigned_count,
+                        "allocation_status": alloc_status
+                    }).eq("id", booking_id).execute()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         return BookingResponse(
             id=str(created_booking["id"]),
             household_id=str(created_booking["household_id"]),
-            worker_id=str(created_booking["worker_id"]) if created_booking.get("worker_id") else None,
+            worker_id=str(assigned_worker_id) if assigned_worker_id else None,
             service_id=str(created_booking["service_id"]),
-            status=created_booking["status"],
+            status=final_booking_status,
+            required_worker_count=payload.required_worker_count,
+            assigned_worker_count=assigned_count,
+            allocation_status=alloc_status,
+            assignments=allocated_assignments if allocated_assignments else None,
             scheduled_time=created_booking.get("scheduled_time"),
             created_at=created_booking.get("created_at"),
             check_in_time=created_booking.get("check_in_time"),
@@ -181,6 +250,7 @@ def create_booking(
 @router.get("/{booking_id}", response_model=BookingResponse)
 def get_booking_by_id(
     booking_id: str,
+    current_user: dict = Depends(get_current_user),
     db: Client = Depends(get_supabase_client)
 ):
     try:
@@ -194,12 +264,52 @@ def get_booking_by_id(
 
         b = res.data[0]
         payments = b.get("payments")
+
+        # RBAC Security Authorization check (Requirement 21)
+        user_role = (current_user.get("role") or "").lower()
+        user_id = str(current_user.get("id"))
+
+        if user_role not in ["admin", "super_admin"]:
+            if user_role == "customer":
+                hh = b.get("households") or {}
+                if hh.get("user_id") and str(hh.get("user_id")) != user_id:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                        detail="Access denied. You can only view your own bookings.")
+            elif user_role in ["cooperative_worker", "independent_worker", "worker"]:
+                w = b.get("workers") or {}
+                w_owner_id = str(w.get("user_id")) if w.get("user_id") else None
+                from app.services.matching import get_assignments_for_booking
+                asgns = get_assignments_for_booking(booking_id)
+                is_assigned = (w_owner_id == user_id) or any(str(a.get("worker_id")) == user_id for a in asgns)
+                if not is_assigned:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                        detail="Access denied. You can only access assignments belonging to yourself.")
+
+        # Fetch assignment records
+        asgns = []
+        try:
+            a_res = db.table("booking_assignments").select("*, workers(*, users(name, phone))").eq("booking_id", booking_id).execute()
+            asgns = a_res.data or []
+        except Exception:
+            pass
+        if not asgns:
+            from app.services.matching import get_assignments_for_booking
+            asgns = get_assignments_for_booking(booking_id)
+
+        req_count = int(b.get("required_worker_count") or 1)
+        asgn_count = int(b.get("assigned_worker_count") or len(asgns))
+        alloc_stat = b.get("allocation_status") or ("ASSIGNED" if (b.get("worker_id") or asgns) else "REQUESTED")
+
         return BookingResponse(
             id=str(b["id"]),
             household_id=str(b["household_id"]),
-            worker_id=str(b["worker_id"]) if b.get("worker_id") else None,
+            worker_id=str(b["worker_id"]) if b.get("worker_id") else (asgns[0]["worker_id"] if asgns else None),
             service_id=str(b["service_id"]),
             status=b["status"],
+            required_worker_count=req_count,
+            assigned_worker_count=asgn_count,
+            allocation_status=alloc_stat,
+            assignments=asgns if asgns else None,
             scheduled_time=b.get("scheduled_time"),
             created_at=b.get("created_at"),
             check_in_time=b.get("check_in_time"),
