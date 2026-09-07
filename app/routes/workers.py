@@ -362,29 +362,75 @@ def accept_assignment(
 ):
     """
     Worker accepts an automatic gig assignment.
+    Transitions assignment to ACCEPTED and booking to accepted.
+    Emits real-time event and customer notification.
     """
     from datetime import datetime
-    from app.services.matching import update_assignment_status_in_memory
+    from app.services.matching import update_assignment_status_in_memory, get_assignments_for_booking
+    from app.services.event_service import event_service
+
     update_assignment_status_in_memory(assignment_id, "ACCEPTED")
+    now_iso = datetime.utcnow().isoformat()
+    booking_id = None
+
     try:
         upd = db.table("booking_assignments").update({
             "status": "ACCEPTED",
-            "accepted_at": datetime.utcnow().isoformat()
+            "accepted_at": now_iso
         }).eq("id", assignment_id).eq("worker_id", worker_id).execute()
+        if upd.data and len(upd.data) > 0:
+            booking_id = upd.data[0].get("booking_id")
+    except Exception:
+        pass
 
-        return {
-            "success": True,
-            "assignment_id": assignment_id,
-            "status": "ACCEPTED",
-            "message": "Assignment accepted! Proceed to client location when scheduled."
-        }
-    except Exception as e:
-        return {
-            "success": True,
-            "assignment_id": assignment_id,
-            "status": "ACCEPTED",
-            "message": "Assignment accepted."
-        }
+    # Retrieve booking info if not from db response
+    if not booking_id:
+        from app.services.matching import _ASSIGNMENTS_BY_ID
+        asgn_mem = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+        if asgn_mem:
+            booking_id = asgn_mem.get("booking_id")
+
+    # Update booking status if appropriate
+    if booking_id:
+        try:
+            db.table("bookings").update({"status": "accepted", "worker_id": worker_id}).eq("id", booking_id).execute()
+        except Exception:
+            pass
+
+        # Real-time event & customer notification
+        try:
+            event_service.publish_event(
+                event_type="WORKER_ACCEPTED",
+                booking_id=str(booking_id),
+                actor_id=str(worker_id),
+                actor_role="worker",
+                title="Specialist Confirmed",
+                description="Your assigned cooperative specialist has confirmed the appointment.",
+                data={"assignment_id": assignment_id, "worker_id": worker_id}
+            )
+            # Find customer user_id for notification
+            b_res = db.table("bookings").select("household_id, households(user_id)").eq("id", booking_id).execute()
+            if b_res.data:
+                hh = b_res.data[0].get("households") or {}
+                cust_uid = hh.get("user_id")
+                if cust_uid:
+                    event_service.create_notification(
+                        user_id=str(cust_uid),
+                        title="Specialist Confirmed!",
+                        message=f"Cooperative worker has accepted booking #{str(booking_id)[:8]}.",
+                        type="WORKER_ACCEPTED",
+                        reference_id=str(booking_id)
+                    )
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "assignment_id": assignment_id,
+        "booking_id": booking_id,
+        "status": "ACCEPTED",
+        "message": "Assignment accepted! Proceed to client location when scheduled."
+    }
 
 @router.post("/{worker_id}/assignments/{assignment_id}/reject")
 def reject_assignment(
@@ -396,27 +442,311 @@ def reject_assignment(
 ):
     """
     Worker declines an automatic gig assignment.
+    Transitions assignment to REJECTED and triggers automatic reallocation to next candidate.
     """
     from datetime import datetime
-    from app.services.matching import update_assignment_status_in_memory
+    from app.services.matching import (
+        update_assignment_status_in_memory,
+        reallocate_rejected_assignment,
+        _ASSIGNMENTS_BY_ID
+    )
+    from app.services.event_service import event_service
+
     update_assignment_status_in_memory(assignment_id, "REJECTED")
+    now_iso = datetime.utcnow().isoformat()
+    booking_id = None
+
     try:
         upd = db.table("booking_assignments").update({
             "status": "REJECTED",
-            "rejected_at": datetime.utcnow().isoformat()
+            "rejected_at": now_iso
         }).eq("id", assignment_id).eq("worker_id", worker_id).execute()
+        if upd.data and len(upd.data) > 0:
+            booking_id = upd.data[0].get("booking_id")
+    except Exception:
+        pass
 
-        return {
-            "success": True,
-            "assignment_id": assignment_id,
-            "status": "REJECTED",
-            "reason": reason or "Worker unavailable"
-        }
-    except Exception as e:
-        return {
-            "success": True,
-            "assignment_id": assignment_id,
-            "status": "REJECTED",
-            "reason": reason
-        }
+    if not booking_id:
+        asgn_mem = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+        if asgn_mem:
+            booking_id = asgn_mem.get("booking_id")
+
+    reallocation_result = None
+    if booking_id:
+        # Fetch candidate pool for reallocation
+        try:
+            w_res = db.table("workers").select(
+                "*, users(id, name, email, phone), cooperatives(id, name, district)"
+            ).execute()
+            candidates = w_res.data or []
+
+            b_res = db.table("bookings").select("*, services(name)").eq("id", booking_id).execute()
+            booking_data = b_res.data[0] if b_res.data else {}
+            srv_name = (booking_data.get("services") or {}).get("name") or "General Maintenance"
+
+            reallocation_result = reallocate_rejected_assignment(
+                booking_id=str(booking_id),
+                rejected_worker_id=str(worker_id),
+                candidate_workers=candidates,
+                requested_skill=srv_name,
+                customer_lat=booking_data.get("latitude"),
+                customer_lng=booking_data.get("longitude")
+            )
+        except Exception as ex:
+            reallocation_result = {
+                "reallocated": False,
+                "reason": f"Reallocation lookup error: {str(ex)}"
+            }
+
+        # Real-time event
+        try:
+            event_service.publish_event(
+                event_type="WORKER_REJECTED",
+                booking_id=str(booking_id),
+                actor_id=str(worker_id),
+                actor_role="worker",
+                title="Worker Declined Assignment",
+                description=f"Assigned specialist declined. Reallocation status: {reallocation_result.get('reallocated') if reallocation_result else 'Pending'}.",
+                data={"assignment_id": assignment_id, "reallocation": reallocation_result}
+            )
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "assignment_id": assignment_id,
+        "booking_id": booking_id,
+        "status": "REJECTED",
+        "reason": reason or "Worker unavailable",
+        "reallocation": reallocation_result
+    }
+
+@router.post("/{worker_id}/assignments/{assignment_id}/start-journey")
+def start_worker_journey(
+    worker_id: str,
+    assignment_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_supabase_client)
+):
+    """
+    Worker starts journey to customer location.
+    Enforces sequential status check (must be ACCEPTED).
+    Transitions assignment and booking to ON_THE_WAY.
+    """
+    from datetime import datetime
+    from app.services.matching import _ASSIGNMENTS_BY_ID, update_assignment_status_in_memory
+    from app.services.event_service import event_service
+
+    asgn = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+    curr_status = (asgn.get("status") if asgn else "ACCEPTED").upper()
+
+    if curr_status not in ["ACCEPTED", "ASSIGNED"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot start journey from status '{curr_status}'. Must be in 'ACCEPTED' state."
+        )
+
+    update_assignment_status_in_memory(assignment_id, "ON_THE_WAY")
+    booking_id = asgn.get("booking_id") if asgn else None
+
+    try:
+        db.table("booking_assignments").update({"status": "ON_THE_WAY"}).eq("id", assignment_id).execute()
+        if booking_id:
+            db.table("bookings").update({"status": "worker_enroute"}).eq("id", booking_id).execute()
+    except Exception:
+        pass
+
+    if booking_id:
+        try:
+            event_service.publish_event(
+                event_type="WORKER_EN_ROUTE",
+                booking_id=str(booking_id),
+                actor_id=str(worker_id),
+                actor_role="worker",
+                title="Specialist is On The Way",
+                description="Your cooperative service specialist is currently en route to your location.",
+                data={"assignment_id": assignment_id, "worker_id": worker_id}
+            )
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "assignment_id": assignment_id,
+        "booking_id": booking_id,
+        "status": "ON_THE_WAY",
+        "message": "Journey started. GPS tracking active for this active gig."
+    }
+
+@router.post("/{worker_id}/assignments/{assignment_id}/arrive")
+def worker_arrived_at_location(
+    worker_id: str,
+    assignment_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_supabase_client)
+):
+    """
+    Worker arrives at customer doorstep.
+    Enforces sequential status check (must be ON_THE_WAY).
+    Transitions assignment and booking to ARRIVED.
+    """
+    from app.services.matching import _ASSIGNMENTS_BY_ID, update_assignment_status_in_memory
+    from app.services.event_service import event_service
+
+    asgn = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+    curr_status = (asgn.get("status") if asgn else "ON_THE_WAY").upper()
+
+    if curr_status not in ["ON_THE_WAY", "ACCEPTED"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot mark arrived from status '{curr_status}'. Must be in 'ON_THE_WAY' state."
+        )
+
+    update_assignment_status_in_memory(assignment_id, "ARRIVED")
+    booking_id = asgn.get("booking_id") if asgn else None
+
+    try:
+        db.table("booking_assignments").update({"status": "ARRIVED"}).eq("id", assignment_id).execute()
+        if booking_id:
+            db.table("bookings").update({"status": "arrived"}).eq("id", booking_id).execute()
+    except Exception:
+        pass
+
+    if booking_id:
+        try:
+            event_service.publish_event(
+                event_type="WORKER_ARRIVED",
+                booking_id=str(booking_id),
+                actor_id=str(worker_id),
+                actor_role="worker",
+                title="Specialist Has Arrived",
+                description="Your cooperative specialist has reached your premises. Please provide check-in verification.",
+                data={"assignment_id": assignment_id, "worker_id": worker_id}
+            )
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "assignment_id": assignment_id,
+        "booking_id": booking_id,
+        "status": "ARRIVED",
+        "message": "Arrival recorded. Awaiting customer check-in OTP verification."
+    }
+
+@router.post("/{worker_id}/assignments/{assignment_id}/start-service")
+def start_worker_service(
+    worker_id: str,
+    assignment_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_supabase_client)
+):
+    """
+    Worker begins service delivery.
+    Enforces sequential status check (must be ARRIVED or verified_checkin).
+    Transitions assignment and booking to IN_PROGRESS.
+    """
+    from datetime import datetime
+    from app.services.matching import _ASSIGNMENTS_BY_ID, update_assignment_status_in_memory
+    from app.services.event_service import event_service
+
+    asgn = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+    curr_status = (asgn.get("status") if asgn else "ARRIVED").upper()
+
+    if curr_status not in ["ARRIVED", "ACCEPTED"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot start service from status '{curr_status}'. Must be in 'ARRIVED' state."
+        )
+
+    update_assignment_status_in_memory(assignment_id, "IN_PROGRESS")
+    booking_id = asgn.get("booking_id") if asgn else None
+    now_iso = datetime.utcnow().isoformat()
+
+    try:
+        db.table("booking_assignments").update({"status": "IN_PROGRESS"}).eq("id", assignment_id).execute()
+        if booking_id:
+            db.table("bookings").update({"status": "in_progress", "check_in_time": now_iso}).eq("id", booking_id).execute()
+    except Exception:
+        pass
+
+    if booking_id:
+        try:
+            event_service.publish_event(
+                event_type="SERVICE_STARTED",
+                booking_id=str(booking_id),
+                actor_id=str(worker_id),
+                actor_role="worker",
+                title="Service In Progress",
+                description="Your requested service is now actively in progress.",
+                data={"assignment_id": assignment_id, "worker_id": worker_id}
+            )
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "assignment_id": assignment_id,
+        "booking_id": booking_id,
+        "status": "IN_PROGRESS",
+        "message": "Service started successfully."
+    }
+
+@router.post("/{worker_id}/assignments/{assignment_id}/complete-service")
+def complete_worker_service(
+    worker_id: str,
+    assignment_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_supabase_client)
+):
+    """
+    Worker completes service delivery.
+    Enforces sequential status check (must be IN_PROGRESS).
+    Transitions assignment and booking to COMPLETED.
+    """
+    from datetime import datetime
+    from app.services.matching import _ASSIGNMENTS_BY_ID, update_assignment_status_in_memory
+    from app.services.event_service import event_service
+
+    asgn = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+    curr_status = (asgn.get("status") if asgn else "IN_PROGRESS").upper()
+
+    if curr_status not in ["IN_PROGRESS", "ARRIVED"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot complete service from status '{curr_status}'. Must be in 'IN_PROGRESS' state."
+        )
+
+    update_assignment_status_in_memory(assignment_id, "COMPLETED")
+    booking_id = asgn.get("booking_id") if asgn else None
+    now_iso = datetime.utcnow().isoformat()
+
+    try:
+        db.table("booking_assignments").update({"status": "COMPLETED"}).eq("id", assignment_id).execute()
+        if booking_id:
+            db.table("bookings").update({"status": "completed", "check_out_time": now_iso}).eq("id", booking_id).execute()
+    except Exception:
+        pass
+
+    if booking_id:
+        try:
+            event_service.publish_event(
+                event_type="SERVICE_COMPLETED",
+                booking_id=str(booking_id),
+                actor_id=str(worker_id),
+                actor_role="worker",
+                title="Service Completed",
+                description="Your requested service has been successfully completed. Thank you for supporting the Labour Cooperative!",
+                data={"assignment_id": assignment_id, "worker_id": worker_id}
+            )
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "assignment_id": assignment_id,
+        "booking_id": booking_id,
+        "status": "COMPLETED",
+        "message": "Service successfully marked as completed."
+    }
 

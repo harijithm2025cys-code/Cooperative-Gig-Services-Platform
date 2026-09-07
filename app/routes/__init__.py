@@ -8,6 +8,7 @@ from app.routes.health import router as health_router
 from app.routes.verification import router as verification_router
 from app.routes.tariffs import router as tariffs_router
 from app.routes.bulk_bookings import router as bulk_bookings_router
+from app.routes.notifications import router as notifications_router
 
 __all__ = [
     "auth_router",
@@ -20,5 +21,7 @@ __all__ = [
     "verification_router",
     "tariffs_router",
     "bulk_bookings_router",
+    "notifications_router",
 ]
+
 

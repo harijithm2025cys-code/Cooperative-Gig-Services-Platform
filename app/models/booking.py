@@ -144,3 +144,8 @@ class WorkerLocationResponse(BaseModel):
     longitude: float
     timestamp: datetime
     message: str
+    distance_to_customer_km: Optional[float] = None
+    eta_minutes: Optional[int] = None
+    eta_formatted: Optional[str] = None
+    booking_id: Optional[str] = None
+    assignment_id: Optional[str] = None

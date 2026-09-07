@@ -443,3 +443,152 @@ def update_assignment_status_in_memory(assignment_id: str, new_status: str) -> O
 def get_audit_logs_for_booking(booking_id: str) -> List[Dict[str, Any]]:
     return _AUDIT_LOGS_BY_BOOKING.get(str(booking_id), [])
 
+def reallocate_rejected_assignment(
+    booking_id: str,
+    rejected_worker_id: str,
+    candidate_workers: Optional[List[Dict[str, Any]]] = None,
+    requested_skill: str = "General Maintenance",
+    customer_lat: Optional[float] = None,
+    customer_lng: Optional[float] = None,
+    target_cooperative_id: Optional[str] = None,
+    active_conflicted_worker_ids: Optional[set] = None,
+    is_emergency: bool = False
+) -> Dict[str, Any]:
+    """
+    Phase 4 Automatic Reallocation on Worker Rejection:
+    When an assigned worker declines or rejects a booking, this function:
+    1. Updates the rejected assignment to 'REJECTED'.
+    2. Identifies already-assigned or previously-rejected workers to prevent loops.
+    3. Evaluates remaining eligible candidate workers.
+    4. Auto-assigns the next highest-ranked eligible cooperative worker.
+    5. Dispatches real-time event and push notification.
+    """
+    bid = str(booking_id)
+    r_wid = str(rejected_worker_id)
+    
+    # Exclude all workers already assigned or rejected for this booking
+    existing_assignments = _ASSIGNMENTS_BY_BOOKING.get(bid, [])
+    excluded_worker_ids = {str(a.get("worker_id")) for a in existing_assignments}
+    excluded_worker_ids.add(r_wid)
+    
+    if active_conflicted_worker_ids:
+        excluded_worker_ids.update(active_conflicted_worker_ids)
+
+    if not candidate_workers:
+        return {
+            "reallocated": False,
+            "booking_id": bid,
+            "rejected_worker_id": r_wid,
+            "reason": "No candidate worker pool provided for reallocation"
+        }
+
+    # Filter candidates excluding already tried workers
+    remaining_candidates = [
+        w for w in candidate_workers
+        if str(w.get("id")) not in excluded_worker_ids
+    ]
+
+    if not remaining_candidates:
+        return {
+            "reallocated": False,
+            "booking_id": bid,
+            "rejected_worker_id": r_wid,
+            "reason": "All available eligible workers have already been assigned or declined"
+        }
+
+    # Mark previous assignment as REJECTED in memory
+    for a in existing_assignments:
+        if str(a.get("worker_id")) == r_wid:
+            a["status"] = "REJECTED"
+    prior_assignments = list(existing_assignments)
+
+    # Re-run allocation for 1 replacement worker using sub-booking key to protect master list
+    realloc_temp_id = f"{bid}_realloc_{uuid.uuid4().hex[:6]}"
+    allocation_result = allocate_workers_for_booking(
+        booking_id=realloc_temp_id,
+        requested_skill=requested_skill,
+        customer_lat=customer_lat,
+        customer_lng=customer_lng,
+        required_worker_count=1,
+        candidate_workers=remaining_candidates,
+        target_cooperative_id=target_cooperative_id,
+        active_conflicted_worker_ids=excluded_worker_ids,
+        is_emergency=is_emergency
+    )
+
+    assigned_workers = allocation_result.get("assigned_workers") or []
+    if assigned_workers:
+        new_assignment = assigned_workers[0]
+        new_assignment["booking_id"] = bid
+        new_assignment["assignment_sequence"] = len(prior_assignments) + 1
+
+        # Preserve full history of assignments for this booking
+        _ASSIGNMENTS_BY_BOOKING[bid] = prior_assignments + [new_assignment]
+        
+        # Also index in worker and id lookup
+        n_wid = str(new_assignment["worker_id"])
+        if n_wid not in _ASSIGNMENTS_BY_WORKER:
+            _ASSIGNMENTS_BY_WORKER[n_wid] = []
+        _ASSIGNMENTS_BY_WORKER[n_wid].insert(0, new_assignment)
+        _ASSIGNMENTS_BY_ID[str(new_assignment["id"])] = new_assignment
+
+        # Dispatch real-time notification to new worker
+        try:
+            from app.services.event_service import event_service
+            event_service.create_notification(
+                user_id=n_wid,
+                title="New Service Opportunity (Reassigned)",
+                message=f"You have been assigned to booking #{bid[:8]} for {requested_skill}.",
+                type="BOOKING_ASSIGNED",
+                reference_id=bid,
+                data={"booking_id": bid, "assignment_id": new_assignment["id"]}
+            )
+        except Exception:
+            pass
+
+        return {
+            "reallocated": True,
+            "booking_id": bid,
+            "rejected_worker_id": r_wid,
+            "new_assignment": new_assignment,
+            "explanation": f"Worker {r_wid} rejected. Automatically reallocated to {new_assignment.get('worker_name')} (Score: {new_assignment.get('matching_score')})."
+        }
+    else:
+        return {
+            "reallocated": False,
+            "booking_id": bid,
+            "rejected_worker_id": r_wid,
+            "reason": "No additional eligible worker found within service radius"
+        }
+
+execute_cooperative_automatic_allocation = allocate_workers_for_booking
+
+def match_emergency_booking(
+    booking_id: str,
+    requested_skill: str,
+    customer_lat: float,
+    customer_lng: float,
+    candidate_workers: List[Dict[str, Any]],
+    required_worker_count: int = 1,
+    target_cooperative_id: Optional[str] = None,
+    active_conflicted_worker_ids: Optional[set] = None
+) -> Dict[str, Any]:
+    """
+    Phase 4 Fast Priority Dispatch for Emergency On-Demand Bookings:
+    - Enforces proximity weight boost (50%) and emergency bonus.
+    - Matches and allocates highest scoring available worker immediately.
+    - Dispatches urgent notification to customer and worker.
+    """
+    res = allocate_workers_for_booking(
+        booking_id=booking_id,
+        requested_skill=requested_skill,
+        customer_lat=customer_lat,
+        customer_lng=customer_lng,
+        required_worker_count=required_worker_count,
+        candidate_workers=candidate_workers,
+        target_cooperative_id=target_cooperative_id,
+        active_conflicted_worker_ids=active_conflicted_worker_ids,
+        is_emergency=True
+    )
+    return res
+

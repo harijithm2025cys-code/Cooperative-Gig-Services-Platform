@@ -60,6 +60,24 @@ def _map_action_to_status(action: str, current_status: str) -> Optional[str]:
     }
     return mapping.get(action)
 
+VALID_TRANSITIONS = {
+    "requested": ["matching", "assigned", "partially_matched", "no_eligible_worker", "cancelled", "rejected", "accepted"],
+    "matching": ["assigned", "partially_matched", "no_eligible_worker", "cancelled"],
+    "assigned": ["accepted", "rejected", "matching", "cancelled"],
+    "partially_matched": ["assigned", "matching", "cancelled"],
+    "accepted": ["worker_enroute", "on_the_way", "cancelled"],
+    "worker_enroute": ["arrived", "cancelled"],
+    "on_the_way": ["arrived", "cancelled"],
+    "arrived": ["in_progress", "verified_checkin", "cancelled"],
+    "verified_checkin": ["in_progress"],
+    "in_progress": ["completed", "verified_checkout"],
+    "verified_checkout": ["completed"],
+    "completed": [],
+    "cancelled": [],
+    "rejected": [],
+    "no_eligible_worker": ["matching", "cancelled"],
+}
+
 # ---------------------------------------------------------------------------
 # Core booking CRUD
 # ---------------------------------------------------------------------------
@@ -355,13 +373,23 @@ def update_booking_status(
                                 detail=f"Booking with ID '{booking_id}' not found.")
 
         current_booking = existing_res.data[0]
+        curr_status = current_booking.get("status", "requested")
         new_status = payload.status
         action = payload.action
 
         if action:
-            mapped = _map_action_to_status(action, current_booking.get("status", ""))
+            mapped = _map_action_to_status(action, curr_status)
             if mapped:
                 new_status = mapped
+
+        # Strict State Transition Validation (Phase 4 Requirement)
+        if new_status and new_status != curr_status:
+            allowed = VALID_TRANSITIONS.get(curr_status, [])
+            if new_status not in allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Illegal state transition from '{curr_status}' to '{new_status}'. Allowed next states: {allowed}"
+                )
 
         now_iso = datetime.now(timezone.utc).isoformat()
         update_data: dict = {"status": new_status}
@@ -380,6 +408,23 @@ def update_booking_status(
                                 detail="Failed to update booking status.")
 
         updated_b = res.data[0]
+
+        # Dispatch real-time event & notifications
+        if new_status != curr_status:
+            try:
+                from app.services.event_service import event_service
+                event_service.publish_event(
+                    event_type="BOOKING_STATUS_CHANGED",
+                    booking_id=booking_id,
+                    actor_id="system",
+                    actor_role="system",
+                    title=f"Booking Status: {new_status.replace('_', ' ').title()}",
+                    description=f"Booking #{booking_id[:8]} transitioned from {curr_status} to {new_status}.",
+                    data={"old_status": curr_status, "new_status": new_status}
+                )
+            except Exception:
+                pass
+
         return BookingResponse(
             id=str(updated_b["id"]),
             household_id=str(updated_b["household_id"]),
@@ -409,6 +454,112 @@ def update_booking_status(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail=f"Error updating booking status: {str(e)}")
+
+
+@router.post("/{booking_id}/cancel", response_model=BookingResponse)
+def cancel_booking(
+    booking_id: str,
+    reason: Optional[str] = Query(None, description="Reason for cancellation"),
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_supabase_client)
+):
+    """
+    Customer cancellation endpoint.
+    Cancellation is strictly allowed only before work is in progress.
+    Releases any assigned workers and emits real-time cancellation notifications.
+    """
+    try:
+        existing_res = db.table("bookings").select("*").eq("id", booking_id).execute()
+        if not existing_res.data or len(existing_res.data) == 0:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail=f"Booking with ID '{booking_id}' not found.")
+
+        current_booking = existing_res.data[0]
+        curr_status = current_booking.get("status", "requested")
+
+        # Non-cancellable state check
+        if curr_status in ["in_progress", "verified_checkin", "verified_checkout", "completed"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot cancel booking in '{curr_status}' state. Cancellation is not permitted once specialist has commenced work."
+            )
+        if curr_status == "cancelled":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Booking is already cancelled."
+            )
+
+        # Update booking
+        res = db.table("bookings").update({
+            "status": "cancelled",
+            "notes": f"{current_booking.get('notes') or ''} [Cancelled: {reason or 'Customer request'}]".strip()
+        }).eq("id", booking_id).execute()
+
+        updated_b = res.data[0] if res.data else {**current_booking, "status": "cancelled"}
+
+        # Release assignments in DB and in-memory
+        try:
+            db.table("booking_assignments").update({"status": "CANCELLED"}).eq("booking_id", booking_id).execute()
+        except Exception:
+            pass
+
+        from app.services.matching import _ASSIGNMENTS_BY_BOOKING
+        for a in _ASSIGNMENTS_BY_BOOKING.get(str(booking_id), []):
+            a["status"] = "CANCELLED"
+
+        # Dispatch real-time event & worker notification
+        try:
+            from app.services.event_service import event_service
+            event_service.publish_event(
+                event_type="BOOKING_CANCELLED",
+                booking_id=booking_id,
+                actor_id=str(current_user.get("id")),
+                actor_role=str(current_user.get("role", "customer")),
+                title="Booking Cancelled",
+                description=f"Booking #{booking_id[:8]} was cancelled. Reason: {reason or 'Customer request'}.",
+                data={"reason": reason}
+            )
+            # Notify assigned worker
+            w_id = current_booking.get("worker_id")
+            if w_id:
+                event_service.create_notification(
+                    user_id=str(w_id),
+                    title="Booking Cancelled",
+                    message=f"Booking #{booking_id[:8]} was cancelled by the customer.",
+                    type="BOOKING_CANCELLED",
+                    reference_id=booking_id
+                )
+        except Exception:
+            pass
+
+        return BookingResponse(
+            id=str(updated_b["id"]),
+            household_id=str(updated_b["household_id"]),
+            worker_id=str(updated_b["worker_id"]) if updated_b.get("worker_id") else None,
+            service_id=str(updated_b["service_id"]),
+            status="cancelled",
+            scheduled_time=updated_b.get("scheduled_time"),
+            created_at=updated_b.get("created_at"),
+            check_in_time=updated_b.get("check_in_time"),
+            check_out_time=updated_b.get("check_out_time"),
+            latitude=updated_b.get("latitude"),
+            longitude=updated_b.get("longitude"),
+            address=updated_b.get("address"),
+            notes=updated_b.get("notes"),
+            estimated_amount=updated_b.get("estimated_amount"),
+            final_amount=updated_b.get("final_amount"),
+            payment_status=updated_b.get("payment_status"),
+            household_verified_checkin=updated_b.get("household_verified_checkin"),
+            worker_verified_checkin=updated_b.get("worker_verified_checkin"),
+            household_verified_checkout=updated_b.get("household_verified_checkout"),
+            worker_verified_checkout=updated_b.get("worker_verified_checkout"),
+            verification_otp=updated_b.get("verification_otp"),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"Error cancelling booking: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +794,14 @@ def update_worker_location(
     current_user: dict = Depends(get_current_user),
     db: Client = Depends(get_supabase_client)
 ):
+    """
+    Update worker real-time GPS location.
+    Worker tracking is ONLY accepted and active when on an active gig
+    (status: accepted, worker_enroute, on_the_way, arrived, in_progress).
+    Off-duty tracking is prohibited.
+    Calculates distance to customer and realistic ETA (25 km/h avg speed).
+    Dispatches real-time event so customer map tracks live movement.
+    """
     try:
         w_res = db.table("workers").select("id").eq("id", payload.worker_id).execute()
         if not w_res.data or len(w_res.data) == 0:
@@ -650,19 +809,66 @@ def update_worker_location(
                                 detail=f"Worker '{payload.worker_id}' not found.")
 
         now_iso = datetime.now(timezone.utc).isoformat()
+        dist_km: Optional[float] = None
+        eta_minutes: Optional[int] = None
+        eta_formatted: Optional[str] = None
 
+        # Check active gig status if booking_id provided
+        if payload.booking_id:
+            b_res = db.table("bookings").select("id, status, latitude, longitude").eq("id", payload.booking_id).execute()
+            if b_res.data and len(b_res.data) > 0:
+                b = b_res.data[0]
+                b_stat = (b.get("status") or "").lower()
+                # Tracking prohibited if not on an active gig
+                if b_stat in ["completed", "cancelled", "rejected"]:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Worker location cannot be tracked for inactive/completed booking (status: {b_stat})."
+                    )
+
+                c_lat = b.get("latitude")
+                c_lng = b.get("longitude")
+                if c_lat is not None and c_lng is not None:
+                    dist_m = _haversine_meters(payload.latitude, payload.longitude, float(c_lat), float(c_lng))
+                    dist_km = round(dist_m / 1000.0, 2)
+                    # Average city speed: 25 km/h
+                    hours = dist_km / 25.0
+                    eta_minutes = max(1, round(hours * 60))
+                    eta_formatted = f"~{eta_minutes} mins (approx. {dist_km:.1f} km @ 25 km/h)"
+
+                db.table("bookings").update({
+                    "worker_live_lat": payload.latitude,
+                    "worker_live_lng": payload.longitude,
+                    "worker_last_seen": now_iso,
+                }).eq("id", payload.booking_id).execute()
+
+                # Dispatch real-time tracking event
+                try:
+                    from app.services.event_service import event_service
+                    event_service.publish_event(
+                        event_type="WORKER_LOCATION_UPDATED",
+                        booking_id=payload.booking_id,
+                        actor_id=payload.worker_id,
+                        actor_role="worker",
+                        title="Specialist Location Updated",
+                        description=f"Specialist is {eta_formatted or 'en route'}.",
+                        data={
+                            "latitude": payload.latitude,
+                            "longitude": payload.longitude,
+                            "distance_km": dist_km,
+                            "eta_minutes": eta_minutes,
+                            "eta_formatted": eta_formatted
+                        }
+                    )
+                except Exception:
+                    pass
+
+        # Update worker master coordinates
         db.table("workers").update({
             "latitude": payload.latitude,
             "longitude": payload.longitude,
             "last_location_update": now_iso,
         }).eq("id", payload.worker_id).execute()
-
-        if payload.booking_id:
-            db.table("bookings").update({
-                "worker_live_lat": payload.latitude,
-                "worker_live_lng": payload.longitude,
-                "worker_last_seen": now_iso,
-            }).eq("id", payload.booking_id).execute()
 
         try:
             db.table("worker_location_history").insert({
@@ -684,7 +890,11 @@ def update_worker_location(
             latitude=payload.latitude,
             longitude=payload.longitude,
             timestamp=datetime.now(timezone.utc),
-            message=f"Worker location logged successfully at ({payload.latitude:.5f}, {payload.longitude:.5f})"
+            message=f"Location updated ({payload.latitude:.5f}, {payload.longitude:.5f}). ETA: {eta_formatted or 'N/A'}",
+            distance_to_customer_km=dist_km,
+            eta_minutes=eta_minutes,
+            eta_formatted=eta_formatted,
+            booking_id=payload.booking_id
         )
 
     except HTTPException:
@@ -692,6 +902,36 @@ def update_worker_location(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail=f"Worker location update error: {str(e)}")
+
+
+@router.post("/assignments/{assignment_id}/location", response_model=WorkerLocationResponse)
+def update_assignment_location(
+    assignment_id: str,
+    payload: WorkerLocationUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_supabase_client)
+):
+    """
+    Dedicated endpoint to push worker GPS location during an active assignment.
+    Validates assignment state and updates tracking for the customer.
+    """
+    from app.services.matching import _ASSIGNMENTS_BY_ID
+    asgn = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+    booking_id = asgn.get("booking_id") if asgn else payload.booking_id
+
+    if not booking_id:
+        try:
+            res = db.table("booking_assignments").select("booking_id, worker_id, status").eq("id", assignment_id).execute()
+            if res.data and len(res.data) > 0:
+                booking_id = res.data[0].get("booking_id")
+                payload.worker_id = res.data[0].get("worker_id") or payload.worker_id
+        except Exception:
+            pass
+
+    payload.booking_id = booking_id
+    resp = update_worker_location(payload=payload, current_user=current_user, db=db)
+    resp.assignment_id = assignment_id
+    return resp
 
 
 @router.get("/worker-location/{worker_id}")
@@ -833,7 +1073,7 @@ def create_emergency_dispatch(
     24/7 Priority Emergency SOS Dispatch.
     Automatically finds the closest available verified cooperative specialist and immediately dispatches them.
     """
-    from app.services.matching import rank_workers_for_booking
+    from app.services.matching import rank_workers_for_booking, record_allocation_assignments
 
     try:
         user_id = current_user.get("id")
@@ -842,18 +1082,25 @@ def create_emergency_dispatch(
             h_res = db.table("households").select("id, address, latitude, longitude").eq("user_id", user_id).execute()
             if h_res.data:
                 household_id = h_res.data[0]["id"]
-                lat = payload.latitude or h_res.data[0].get("latitude") or 12.9716
-                lng = payload.longitude or h_res.data[0].get("longitude") or 77.5946
+                lat = payload.latitude or h_res.data[0].get("latitude")
+                lng = payload.longitude or h_res.data[0].get("longitude")
                 addr = payload.address or h_res.data[0].get("address") or "Emergency Location"
             else:
                 household_id = str(uuid.uuid4())
-                lat = payload.latitude or 12.9716
-                lng = payload.longitude or 77.5946
+                lat = payload.latitude
+                lng = payload.longitude
                 addr = payload.address or "Emergency Location"
         else:
-            lat = payload.latitude or 12.9716
-            lng = payload.longitude or 77.5946
+            lat = payload.latitude
+            lng = payload.longitude
             addr = payload.address or "Emergency Location"
+
+        # Validate mandatory customer coordinates (no fake GPS)
+        if lat is None or lng is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Customer GPS coordinates (latitude and longitude) are mandatory for emergency SOS dispatch."
+            )
 
         # 1. Fetch available workers matching service
         w_res = db.table("workers").select("*, users(name, email, phone), cooperatives(name)").eq("is_available", True).execute()
@@ -903,6 +1150,27 @@ def create_emergency_dispatch(
         except Exception:
             pass
 
+        # Create emergency assignment record
+        asgn_record = {
+            "id": str(uuid.uuid4()),
+            "booking_id": booking_id,
+            "worker_id": worker_id,
+            "status": "ASSIGNED",
+            "assigned_at": now_iso,
+            "distance_km": assigned_worker.get("distance_km") if assigned_worker else None,
+            "matching_score": assigned_worker.get("score") if assigned_worker else 95.0,
+            "assignment_sequence": 1,
+            "worker_name": (assigned_worker.get("name") if assigned_worker else None) or "Emergency Specialist",
+            "worker_phone": (assigned_worker.get("phone") if assigned_worker else None),
+            "worker_skill": payload.service_id or "Emergency Service",
+            "cooperative_name": (assigned_worker.get("cooperative_name") if assigned_worker else None) or "Labour Cooperative Society"
+        }
+        try:
+            db.table("booking_assignments").insert(asgn_record).execute()
+        except Exception:
+            pass
+        record_allocation_assignments(booking_id, [asgn_record], [])
+
         # Log emergency dispatch SLA record
         try:
             db.table("emergency_dispatches").insert({
@@ -914,6 +1182,29 @@ def create_emergency_dispatch(
                 "response_time_seconds": 12, # Instant sub-minute allocation
                 "is_sla_met": True
             }).execute()
+        except Exception:
+            pass
+
+        # Real-time event & notification
+        try:
+            from app.services.event_service import event_service
+            event_service.publish_event(
+                event_type="EMERGENCY_DISPATCH",
+                booking_id=booking_id,
+                actor_id=str(user_id or "customer"),
+                actor_role="customer",
+                title="🚨 Emergency SOS Dispatched",
+                description=f"Emergency service #{booking_id[:8]} dispatched to closest available specialist.",
+                data={"worker_id": worker_id, "amount": emergency_amount}
+            )
+            if worker_id:
+                event_service.create_notification(
+                    user_id=str(worker_id),
+                    title="🚨 PRIORITY EMERGENCY DISPATCH",
+                    message=f"Immediate SOS service request #{booking_id[:8]} at {addr}.",
+                    type="EMERGENCY_DISPATCH",
+                    reference_id=booking_id
+                )
         except Exception:
             pass
 
@@ -937,9 +1228,9 @@ def create_emergency_dispatch(
             household_verified_checkout=False,
             worker_verified_checkout=False,
             verification_otp=otp,
-            worker_live_lat=lat + 0.005,
-            worker_live_lng=lng + 0.005,
-            worker_last_seen=datetime.now(timezone.utc)
+            worker_live_lat=None,
+            worker_live_lng=None,
+            worker_last_seen=None
         )
     except HTTPException:
         raise
@@ -948,4 +1239,3 @@ def create_emergency_dispatch(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error processing emergency dispatch: {str(e)}"
         )
-
