@@ -4,14 +4,20 @@ from pydantic import BaseModel, Field, ConfigDict
 
 BookingStatusType = Literal[
     "requested",
+    "payment_pending",
+    "paid",
+    "matching",
+    "assigned",
     "accepted",
     "worker_enroute",
+    "on_the_way",
     "arrived",
     "verified_checkin",
-    "payment_pending",
     "payment_released",
     "in_progress",
     "verified_checkout",
+    "customer_confirmation_pending",
+    "customer_confirmed",
     "completed",
     "cancelled",
     "rejected"

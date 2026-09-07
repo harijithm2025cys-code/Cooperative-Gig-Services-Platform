@@ -266,6 +266,21 @@ class PaymentService:
             except Exception as e:
                 logger.debug(f"DB update payment/booking note: {e}")
 
+        # Update in-memory booking as well
+        from app.services.matching import _BOOKINGS_BY_ID, trigger_booking_allocation
+        b_mem = _BOOKINGS_BY_ID.get(str(booking_id))
+        if b_mem:
+            b_mem["payment_status"] = "captured"
+            b_mem["settlement_status"] = "PENDING"
+            b_mem["payment_id"] = record["id"]
+
+        # CRITICAL BUSINESS RULE (Phase 5):
+        # Now that payment is confirmed and CAPTURED, trigger worker matching & dispatch idempotently!
+        try:
+            trigger_booking_allocation(booking_id, db=db)
+        except Exception as alloc_err:
+            logger.warning(f"Error triggering worker allocation after payment verification: {alloc_err}")
+
         cls.record_audit(
             action="PAYMENT_VERIFIED",
             booking_id=booking_id,
@@ -289,7 +304,7 @@ class PaymentService:
             data={"order_id": order_id, "payment_id": payment_id, "amount": record.get("amount")},
             target_user_ids=[customer_id],
             notification_title="Payment Successful",
-            notification_message=f"Your payment of ₹{record.get('amount', 0):.2f} via Razorpay was captured successfully.",
+            notification_message=f"Your payment of ₹{record.get('amount', 0):.2f} via Razorpay was captured successfully. Allocating your cooperative specialist...",
             db=db
         )
 
@@ -328,6 +343,25 @@ class PaymentService:
                 record["signature_verified"] = True
                 record["paid_at"] = datetime.now(timezone.utc).isoformat()
             if booking_id:
+                from app.services.matching import _BOOKINGS_BY_ID, trigger_booking_allocation
+                b_mem = _BOOKINGS_BY_ID.get(str(booking_id))
+                if b_mem:
+                    b_mem["payment_status"] = "captured"
+                    b_mem["settlement_status"] = "PENDING"
+                if db:
+                    try:
+                        db.table("bookings").update({
+                            "payment_status": "captured",
+                            "settlement_status": "PENDING"
+                        }).eq("id", booking_id).execute()
+                    except Exception:
+                        pass
+                # Trigger worker dispatch idempotently
+                try:
+                    trigger_booking_allocation(booking_id, db=db)
+                except Exception as e:
+                    logger.warning(f"Webhook allocation error: {e}")
+
                 cls.record_audit(
                     action="PAYMENT_VERIFIED",
                     booking_id=booking_id,
@@ -339,13 +373,19 @@ class PaymentService:
             if record:
                 record["status"] = "FAILED"
             if booking_id:
-                cls.record_audit(
-                    action="PAYMENT_FAILED",
-                    booking_id=booking_id,
-                    payment_id=record.get("id") if record else None,
-                    metadata={"webhook_event_id": event_id, "gateway_payment_id": payment_id},
-                    db=db
-                )
+                from app.services.matching import _BOOKINGS_BY_ID
+                b_mem = _BOOKINGS_BY_ID.get(str(booking_id))
+                if b_mem:
+                    b_mem["payment_status"] = "failed"
+                    b_mem["status"] = "payment_failed"
+                if db:
+                    try:
+                        db.table("bookings").update({
+                            "payment_status": "failed",
+                            "status": "payment_failed"
+                        }).eq("id", booking_id).execute()
+                    except Exception:
+                        pass
 
         return {"status": "processed", "event_id": event_id, "event_name": event_name}
 

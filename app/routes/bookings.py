@@ -61,7 +61,10 @@ def _map_action_to_status(action: str, current_status: str) -> Optional[str]:
     return mapping.get(action)
 
 VALID_TRANSITIONS = {
-    "requested": ["matching", "assigned", "partially_matched", "no_eligible_worker", "cancelled", "rejected", "accepted"],
+    "requested": ["payment_pending", "matching", "assigned", "partially_matched", "no_eligible_worker", "cancelled", "rejected", "accepted"],
+    "payment_pending": ["paid", "matching", "assigned", "accepted", "partially_matched", "no_eligible_worker", "cancelled", "payment_failed"],
+    "paid": ["matching", "assigned", "accepted", "partially_matched", "no_eligible_worker", "cancelled"],
+    "payment_failed": ["payment_pending", "cancelled"],
     "matching": ["assigned", "partially_matched", "no_eligible_worker", "cancelled"],
     "assigned": ["accepted", "rejected", "matching", "cancelled"],
     "partially_matched": ["assigned", "matching", "cancelled"],
@@ -144,21 +147,24 @@ def create_booking(
         booking_record = {
             "id": booking_id,
             "household_id": household_id,
-            "worker_id": payload.worker_id,
+            "worker_id": None,
             "service_id": payload.service_id,
-            "status": "requested",
+            "status": "payment_pending",
             "requested_at": now_iso,
             "latitude": float(lat),
             "longitude": float(lng),
             "address": addr,
             "notes": payload.notes,
             "estimated_amount": est_amount,
+            "final_amount": est_amount,
             "verification_otp": otp,
             "household_verified_checkin": False,
             "worker_verified_checkin": False,
             "household_verified_checkout": False,
             "worker_verified_checkout": False,
             "payment_status": "pending",
+            "allocation_status": "PAYMENT_PENDING",
+            "assigned_worker_count": 0,
         }
 
         try:
@@ -174,72 +180,21 @@ def create_booking(
 
         created_booking = res.data[0]
 
-        # Automatic Worker Allocation Pipeline (Phase 3 Requirement 1, 8, 11)
-        assigned_worker_id = payload.worker_id
-        assigned_count = 1 if payload.worker_id else 0
-        alloc_status = "ASSIGNED" if payload.worker_id else "REQUESTED"
-        final_booking_status = "accepted" if payload.worker_id else "requested"
-        allocated_assignments = []
-
-        if not payload.worker_id:
-            try:
-                from app.services.matching import allocate_workers_for_booking
-                w_res = db.table("workers").select(
-                    "*, users(id, name, email, phone), cooperatives(id, name, district)"
-                ).execute()
-                candidates = w_res.data or []
-
-                active_res = db.table("bookings").select("worker_id").in_(
-                    "status", ["accepted", "worker_enroute", "arrived", "in_progress"]
-                ).not_.is_("worker_id", "null").execute()
-                conflicted_ids = {str(r["worker_id"]) for r in (active_res.data or []) if r.get("worker_id")}
-
-                alloc_res = allocate_workers_for_booking(
-                    booking_id=booking_id,
-                    requested_skill=srv.get("name") or payload.service_id,
-                    customer_lat=float(lat),
-                    customer_lng=float(lng),
-                    required_worker_count=payload.required_worker_count,
-                    candidate_workers=candidates,
-                    active_conflicted_worker_ids=conflicted_ids
-                )
-
-                allocated_assignments = alloc_res.get("assigned_workers", [])
-                assigned_count = alloc_res.get("assigned_worker_count", 0)
-                alloc_status = alloc_res.get("allocation_status", "NO_ELIGIBLE_WORKER")
-
-                if alloc_status == "ASSIGNED":
-                    final_booking_status = "accepted"
-                    assigned_worker_id = allocated_assignments[0]["worker_id"]
-                elif alloc_status == "PARTIALLY_MATCHED":
-                    final_booking_status = "partially_matched"
-                    assigned_worker_id = allocated_assignments[0]["worker_id"] if allocated_assignments else None
-                else:
-                    final_booking_status = "requested"
-                    assigned_worker_id = None
-
-                # Persist allocation result to booking record
-                try:
-                    db.table("bookings").update({
-                        "worker_id": assigned_worker_id,
-                        "status": final_booking_status,
-                        "assigned_worker_count": assigned_count,
-                        "allocation_status": alloc_status
-                    }).eq("id", booking_id).execute()
-                except Exception:
-                    pass
-            except Exception:
-                pass
+        # CRITICAL BUSINESS RULE (Phase 5):
+        # Customer payment MUST be confirmed and captured before worker dispatch or allocation.
+        # Booking starts in payment_pending. Worker allocation happens upon verified payment capture.
+        from app.services.matching import _BOOKINGS_BY_ID
+        _BOOKINGS_BY_ID[str(booking_id)] = booking_record
 
         return BookingResponse(
             id=str(created_booking["id"]),
             household_id=str(created_booking["household_id"]),
-            worker_id=str(assigned_worker_id) if assigned_worker_id else None,
+            worker_id=None,
             service_id=str(created_booking["service_id"]),
-            status=final_booking_status,
+            status="payment_pending",
             required_worker_count=payload.required_worker_count,
-            assigned_worker_count=assigned_count,
-            allocation_status=alloc_status,
+            assigned_worker_count=0,
+            allocation_status="PAYMENT_PENDING",
             assignments=allocated_assignments if allocated_assignments else None,
             scheduled_time=created_booking.get("scheduled_time"),
             created_at=created_booking.get("created_at"),
@@ -370,12 +325,23 @@ def update_booking_status(
     db: Client = Depends(get_supabase_client)
 ):
     try:
-        existing_res = db.table("bookings").select("*").eq("id", booking_id).execute()
-        if not existing_res.data or len(existing_res.data) == 0:
+        current_booking = None
+        if db:
+            try:
+                existing_res = db.table("bookings").select("*").eq("id", booking_id).execute()
+                if existing_res.data and len(existing_res.data) > 0:
+                    current_booking = existing_res.data[0]
+            except Exception:
+                pass
+
+        if not current_booking:
+            from app.services.matching import _BOOKINGS_BY_ID
+            current_booking = _BOOKINGS_BY_ID.get(str(booking_id))
+
+        if not current_booking:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                                 detail=f"Booking with ID '{booking_id}' not found.")
 
-        current_booking = existing_res.data[0]
         curr_status = current_booking.get("status", "requested")
         new_status = payload.status
         action = payload.action
@@ -394,6 +360,16 @@ def update_booking_status(
                     detail=f"Illegal state transition from '{curr_status}' to '{new_status}'. Allowed next states: {allowed}"
                 )
 
+        # CRITICAL BUSINESS RULE (Phase 5):
+        # A booking cannot be dispatched, assigned, or started unless customer payment has been captured.
+        if new_status in ("matching", "assigned", "accepted", "worker_enroute", "on_the_way", "arrived", "in_progress"):
+            b_pay_status = str(current_booking.get("payment_status", "pending")).lower()
+            if b_pay_status not in ("captured", "released", "paid"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Cannot transition booking to '{new_status}'. Customer payment must be captured before dispatch (current payment status: '{b_pay_status}')."
+                )
+
         now_iso = datetime.now(timezone.utc).isoformat()
         update_data: dict = {"status": new_status}
 
@@ -405,12 +381,21 @@ def update_booking_status(
             update_data["payment_status"] = "released"
             update_data["final_amount"] = current_booking.get("estimated_amount")
 
-        res = db.table("bookings").update(update_data).eq("id", booking_id).execute()
-        if not res.data:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                                detail="Failed to update booking status.")
+        updated_b = None
+        if db:
+            try:
+                res = db.table("bookings").update(update_data).eq("id", booking_id).execute()
+                if res.data and len(res.data) > 0:
+                    updated_b = res.data[0]
+            except Exception:
+                pass
 
-        updated_b = res.data[0]
+        if not updated_b:
+            current_booking.update(update_data)
+            updated_b = current_booking
+
+        from app.services.matching import _BOOKINGS_BY_ID
+        _BOOKINGS_BY_ID[str(booking_id)] = updated_b
 
         # Dispatch real-time event & notifications
         if new_status != curr_status:
@@ -1105,46 +1090,35 @@ def create_emergency_dispatch(
                 detail="Customer GPS coordinates (latitude and longitude) are mandatory for emergency SOS dispatch."
             )
 
-        # 1. Fetch available workers matching service
-        w_res = db.table("workers").select("*, users(name, email, phone), cooperatives(name)").eq("is_available", True).execute()
-        candidates = w_res.data or []
-
-        # 2. Score with emergency priority
-        ranked = rank_workers_for_booking(
-            requested_skill=payload.service_id or "Electrician",
-            request_lat=lat,
-            request_lng=lng,
-            available_workers=candidates,
-            is_emergency=True
-        )
-
-        assigned_worker = ranked[0] if ranked else None
-        worker_id = assigned_worker["worker_id"] if assigned_worker else (payload.worker_id or "wrk_1")
-
         booking_id = str(uuid.uuid4())
         now_iso = datetime.now(timezone.utc).isoformat()
         base_rate = float(payload.estimated_amount or 450.0)
         emergency_amount = round(base_rate * 1.25, 2) # 25% emergency surcharge
         otp = _generate_otp()
 
+        # CRITICAL BUSINESS RULE:
+        # Emergency booking starts in payment_pending. No emergency worker is dispatched before payment.
         booking_record = {
             "id": booking_id,
             "household_id": household_id,
-            "worker_id": worker_id,
+            "worker_id": None,
             "service_id": payload.service_id or "Electrician",
-            "status": "accepted",
+            "status": "payment_pending",
             "requested_at": now_iso,
             "latitude": lat,
             "longitude": lng,
             "address": addr,
             "notes": f"[24/7 EMERGENCY SOS] {payload.notes or 'Immediate Assistance Required'}",
             "estimated_amount": emergency_amount,
+            "final_amount": emergency_amount,
             "verification_otp": otp,
             "household_verified_checkin": False,
             "worker_verified_checkin": False,
             "household_verified_checkout": False,
             "worker_verified_checkout": False,
             "payment_status": "pending",
+            "allocation_status": "PAYMENT_PENDING",
+            "assigned_worker_count": 0,
             "is_emergency": True
         }
 
@@ -1153,70 +1127,17 @@ def create_emergency_dispatch(
         except Exception:
             pass
 
-        # Create emergency assignment record
-        asgn_record = {
-            "id": str(uuid.uuid4()),
-            "booking_id": booking_id,
-            "worker_id": worker_id,
-            "status": "ASSIGNED",
-            "assigned_at": now_iso,
-            "distance_km": assigned_worker.get("distance_km") if assigned_worker else None,
-            "matching_score": assigned_worker.get("score") if assigned_worker else 95.0,
-            "assignment_sequence": 1,
-            "worker_name": (assigned_worker.get("name") if assigned_worker else None) or "Emergency Specialist",
-            "worker_phone": (assigned_worker.get("phone") if assigned_worker else None),
-            "worker_skill": payload.service_id or "Emergency Service",
-            "cooperative_name": (assigned_worker.get("cooperative_name") if assigned_worker else None) or "Labour Cooperative Society"
-        }
-        try:
-            db.table("booking_assignments").insert(asgn_record).execute()
-        except Exception:
-            pass
-        record_allocation_assignments(booking_id, [asgn_record], [])
-
-        # Log emergency dispatch SLA record
-        try:
-            db.table("emergency_dispatches").insert({
-                "id": str(uuid.uuid4()),
-                "booking_id": booking_id,
-                "priority_level": "critical_24_7",
-                "requested_at": now_iso,
-                "dispatched_at": now_iso,
-                "response_time_seconds": 12, # Instant sub-minute allocation
-                "is_sla_met": True
-            }).execute()
-        except Exception:
-            pass
-
-        # Real-time event & notification
-        try:
-            from app.services.event_service import event_service
-            event_service.publish_event(
-                event_type="EMERGENCY_DISPATCH",
-                booking_id=booking_id,
-                actor_id=str(user_id or "customer"),
-                actor_role="customer",
-                title="🚨 Emergency SOS Dispatched",
-                description=f"Emergency service #{booking_id[:8]} dispatched to closest available specialist.",
-                data={"worker_id": worker_id, "amount": emergency_amount}
-            )
-            if worker_id:
-                event_service.create_notification(
-                    user_id=str(worker_id),
-                    title="🚨 PRIORITY EMERGENCY DISPATCH",
-                    message=f"Immediate SOS service request #{booking_id[:8]} at {addr}.",
-                    type="EMERGENCY_DISPATCH",
-                    reference_id=booking_id
-                )
-        except Exception:
-            pass
+        from app.services.matching import _BOOKINGS_BY_ID
+        _BOOKINGS_BY_ID[str(booking_id)] = booking_record
 
         return BookingResponse(
             id=booking_id,
             household_id=household_id,
-            worker_id=worker_id,
+            worker_id=None,
             service_id=payload.service_id or "Emergency Service",
-            status="accepted",
+            status="payment_pending",
+            allocation_status="PAYMENT_PENDING",
+            assigned_worker_count=0,
             scheduled_time=datetime.now(timezone.utc),
             created_at=datetime.now(timezone.utc),
             latitude=lat,
@@ -1224,7 +1145,7 @@ def create_emergency_dispatch(
             address=addr,
             notes=booking_record["notes"],
             estimated_amount=emergency_amount,
-            final_amount=None,
+            final_amount=emergency_amount,
             payment_status="pending",
             household_verified_checkin=False,
             worker_verified_checkin=False,

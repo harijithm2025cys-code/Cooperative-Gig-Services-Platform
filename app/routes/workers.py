@@ -356,6 +356,32 @@ def get_worker_assignments(
             ]
         }
 
+def _check_booking_paid(booking_id: Optional[str], db: Client) -> None:
+    """
+    CRITICAL BUSINESS RULE (Phase 5):
+    Ensures that customer payment has been confirmed and captured before any worker action.
+    """
+    if not booking_id:
+        return
+    from app.services.matching import _BOOKINGS_BY_ID
+    booking = _BOOKINGS_BY_ID.get(str(booking_id))
+    if not booking and db:
+        try:
+            b_res = db.table("bookings").select("*").eq("id", booking_id).execute()
+            if b_res.data:
+                booking = b_res.data[0]
+                _BOOKINGS_BY_ID[str(booking_id)] = booking
+        except Exception:
+            pass
+
+    if booking:
+        b_pay = str(booking.get("payment_status", "pending")).lower()
+        if b_pay not in ("captured", "released", "paid"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot proceed with assignment for an unpaid booking (payment status: '{b_pay}'). Customer payment must be captured before dispatch."
+            )
+
 @router.post("/{worker_id}/assignments/{assignment_id}/accept")
 def accept_assignment(
     worker_id: str,
@@ -369,8 +395,12 @@ def accept_assignment(
     Emits real-time event and customer notification.
     """
     from datetime import datetime
-    from app.services.matching import update_assignment_status_in_memory, get_assignments_for_booking
+    from app.services.matching import update_assignment_status_in_memory, get_assignments_for_booking, _ASSIGNMENTS_BY_ID
     from app.services.event_service import event_service
+
+    asgn_mem = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+    booking_id = asgn_mem.get("booking_id") if asgn_mem else None
+    _check_booking_paid(booking_id, db)
 
     update_assignment_status_in_memory(assignment_id, "ACCEPTED")
     now_iso = datetime.utcnow().isoformat()
@@ -541,6 +571,8 @@ def start_worker_journey(
     from app.services.event_service import event_service
 
     asgn = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+    booking_id = asgn.get("booking_id") if asgn else None
+    _check_booking_paid(booking_id, db)
     curr_status = (asgn.get("status") if asgn else "ACCEPTED").upper()
 
     if curr_status not in ["ACCEPTED", "ASSIGNED"]:
@@ -597,6 +629,8 @@ def worker_arrived_at_location(
     from app.services.event_service import event_service
 
     asgn = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+    booking_id = asgn.get("booking_id") if asgn else None
+    _check_booking_paid(booking_id, db)
     curr_status = (asgn.get("status") if asgn else "ON_THE_WAY").upper()
 
     if curr_status not in ["ON_THE_WAY", "ACCEPTED"]:
@@ -654,6 +688,8 @@ def start_worker_service(
     from app.services.event_service import event_service
 
     asgn = _ASSIGNMENTS_BY_ID.get(str(assignment_id))
+    booking_id = asgn.get("booking_id") if asgn else None
+    _check_booking_paid(booking_id, db)
     curr_status = (asgn.get("status") if asgn else "ARRIVED").upper()
 
     if curr_status not in ["ARRIVED", "ACCEPTED"]:
@@ -672,6 +708,11 @@ def start_worker_service(
             db.table("bookings").update({"status": "in_progress", "check_in_time": now_iso}).eq("id", booking_id).execute()
     except Exception:
         pass
+
+    from app.services.matching import _BOOKINGS_BY_ID
+    if booking_id and str(booking_id) in _BOOKINGS_BY_ID:
+        _BOOKINGS_BY_ID[str(booking_id)]["status"] = "in_progress"
+        _BOOKINGS_BY_ID[str(booking_id)]["check_in_time"] = now_iso
 
     if booking_id:
         try:

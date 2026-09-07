@@ -66,6 +66,20 @@ def create_payment_order(
             except Exception:
                 pass
 
+    # Verify booking is in payable state
+    b_pay_status = str(booking.get("payment_status", "pending")).lower()
+    b_status = str(booking.get("status", "payment_pending")).lower()
+    if b_pay_status in ("captured", "released", "paid"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Booking '{bid}' has already been paid and captured."
+        )
+    if b_status in ("cancelled", "completed"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot create payment order for booking in '{b_status}' status."
+        )
+
     # Calculate payable amount strictly server-side
     amount = float(booking.get("final_amount") or booking.get("amount") or booking.get("estimated_amount") or 450.0)
     if amount <= 0:
