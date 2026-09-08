@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 import uuid
 import random
@@ -5,6 +6,8 @@ import math
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from supabase import Client
+
+logger = logging.getLogger("bookings_router")
 
 from app.db.supabase_client import get_supabase_client
 from app.core.dependencies import get_current_user
@@ -978,26 +981,34 @@ def get_household_bookings(
         bookings = []
         if db:
             try:
-                query = db.table("bookings").select("*, services(*), workers(*, users(name, phone))").eq("household_id", household_id)
+                is_uuid = False
                 try:
-                    res = query.order("requested_at", desc=True).execute()
+                    uuid.UUID(str(household_id))
+                    is_uuid = True
                 except Exception:
-                    res = query.execute()
-                bookings = res.data or []
+                    pass
 
-                if not bookings:
+                if is_uuid:
+                    query = db.table("bookings").select("*, services(*), workers(*, users(name, phone))").eq("household_id", household_id)
                     try:
-                        h_lookup = db.table("households").select("id").eq("user_id", household_id).execute()
-                        if h_lookup.data and len(h_lookup.data) > 0:
-                            actual_hh_id = h_lookup.data[0]["id"]
-                            res2 = db.table("bookings").select("*, services(*), workers(*, users(name, phone))").eq("household_id", actual_hh_id)
-                            try:
-                                res2 = res2.order("requested_at", desc=True).execute()
-                            except Exception:
-                                res2 = res2.execute()
-                            bookings = res2.data or []
+                        res = query.order("requested_at", desc=True).execute()
                     except Exception:
-                        pass
+                        res = query.execute()
+                    bookings = res.data or []
+
+                    if not bookings:
+                        try:
+                            h_lookup = db.table("households").select("id").eq("user_id", household_id).execute()
+                            if h_lookup.data and len(h_lookup.data) > 0:
+                                actual_hh_id = h_lookup.data[0]["id"]
+                                res2 = db.table("bookings").select("*, services(*), workers(*, users(name, phone))").eq("household_id", actual_hh_id)
+                                try:
+                                    res2 = res2.order("requested_at", desc=True).execute()
+                                except Exception:
+                                    res2 = res2.execute()
+                                bookings = res2.data or []
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.warning(f"Error querying household bookings from DB: {e}")
 
@@ -1055,26 +1066,34 @@ def get_worker_bookings(
         bookings = []
         if db:
             try:
-                query = db.table("bookings").select("*, services(*), households(*, users(name, phone))").eq("worker_id", worker_id)
+                is_uuid = False
                 try:
-                    res = query.order("requested_at", desc=True).execute()
+                    uuid.UUID(str(worker_id))
+                    is_uuid = True
                 except Exception:
-                    res = query.execute()
-                bookings = res.data or []
+                    pass
 
-                if not bookings:
+                if is_uuid:
+                    query = db.table("bookings").select("*, services(*), households(*, users(name, phone))").eq("worker_id", worker_id)
                     try:
-                        w_lookup = db.table("workers").select("id").eq("user_id", worker_id).execute()
-                        if w_lookup.data and len(w_lookup.data) > 0:
-                            actual_w_id = w_lookup.data[0]["id"]
-                            res2 = db.table("bookings").select("*, services(*), households(*, users(name, phone))").eq("worker_id", actual_w_id)
-                            try:
-                                res2 = res2.order("requested_at", desc=True).execute()
-                            except Exception:
-                                res2 = res2.execute()
-                            bookings = res2.data or []
+                        res = query.order("requested_at", desc=True).execute()
                     except Exception:
-                        pass
+                        res = query.execute()
+                    bookings = res.data or []
+
+                    if not bookings:
+                        try:
+                            w_lookup = db.table("workers").select("id").eq("user_id", worker_id).execute()
+                            if w_lookup.data and len(w_lookup.data) > 0:
+                                actual_w_id = w_lookup.data[0]["id"]
+                                res2 = db.table("bookings").select("*, services(*), households(*, users(name, phone))").eq("worker_id", actual_w_id)
+                                try:
+                                    res2 = res2.order("requested_at", desc=True).execute()
+                                except Exception:
+                                    res2 = res2.execute()
+                                bookings = res2.data or []
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.warning(f"Error querying worker bookings from DB: {e}")
 
