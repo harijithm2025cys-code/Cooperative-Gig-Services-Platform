@@ -22,23 +22,23 @@ DEMO_PERSONAS = {
     # Customers / Households
     "ananya@example.com": {
         "id": "10000000-0000-0000-0000-000000000001",
-        "name": "Abhinaya (Citizen Customer)",
+        "name": "Ananya Sharma",
         "email": "ananya@example.com",
-        "phone": "+91 98765 43210",
+        "phone": "+91 98765 12345",
         "role": "customer",
         "profile_id": "hh-demo-001",
         "worker_type": None,
         "cooperative_id": None,
         "cooperative_name": None,
-        "address": "Indiranagar, Bengaluru",
+        "address": "Flat 402, Green Glen Layout, Bengaluru",
     },
     "abhinaya@demo.skillconnect.in": {
-        "id": "10000000-0000-0000-0000-000000000001",
-        "name": "Abhinaya (Citizen Customer)",
+        "id": "10000000-0000-0000-0000-000000000002",
+        "name": "Abhinaya Sundaram",
         "email": "abhinaya@demo.skillconnect.in",
         "phone": "+91 98765 43210",
         "role": "customer",
-        "profile_id": "hh-demo-001",
+        "profile_id": "hh-demo-002",
         "worker_type": None,
         "cooperative_id": None,
         "cooperative_name": None,
@@ -47,7 +47,7 @@ DEMO_PERSONAS = {
     # Cooperative Workers
     "ramesh.worker@coop.org": {
         "id": "20000000-0000-0000-0000-000000000001",
-        "name": "Ravi Kumar (Worker-Owner)",
+        "name": "Ramesh Kumar (Worker-Owner)",
         "email": "ramesh.worker@coop.org",
         "phone": "+91 98450 11223",
         "role": "cooperative_worker",
