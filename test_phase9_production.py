@@ -286,5 +286,38 @@ def test_request_id_and_timing_headers():
     assert "X-Response-Time-Ms" in resp.headers
     assert float(resp.headers["X-Response-Time-Ms"]) >= 0.0
 
+# ---------------------------------------------------------------------------
+# 9. Auth Routes & Demo Personas Fast-Path
+# ---------------------------------------------------------------------------
+def test_auth_routes_and_demo_personas():
+    """Verify /login, /auth/login, /me, /auth/me route aliases and demo persona authentication."""
+    # 1. Root /login alias
+    resp_login = client.post("/login", json={"email": "ananya@example.com", "password": "Demo@2024"})
+    assert resp_login.status_code == 200
+    data = resp_login.json()
+    assert "access_token" in data
+    assert data["role"] == "customer"
+    token = data["access_token"]
+
+    # 2. Prefixed /auth/login
+    resp_auth_login = client.post("/auth/login", json={"email": "ramesh.worker@coop.org", "password": "Demo@2024"})
+    assert resp_auth_login.status_code == 200
+    assert resp_auth_login.json()["role"] == "cooperative_worker"
+
+    # 3. Super Admin demo login
+    resp_admin = client.post("/login", json={"email": "admin@coop.org", "password": "Demo@2024"})
+    assert resp_admin.status_code == 200
+    assert resp_admin.json()["role"] == "super_admin"
+
+    # 4. /me and /auth/me profile verification
+    resp_me = client.get("/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp_me.status_code == 200
+    assert resp_me.json()["user"]["role"] == "customer"
+
+    resp_auth_me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp_auth_me.status_code == 200
+    assert resp_auth_me.json()["user"]["role"] == "customer"
+
 if __name__ == "__main__":
     pytest.main(["-v", "test_phase9_production.py"])
+

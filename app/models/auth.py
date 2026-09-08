@@ -45,9 +45,11 @@ class UserRegister(BaseModel):
 class UserLogin(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
+    username: Optional[str] = None
     password: str
+    role: Optional[str] = None
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
 class Token(BaseModel):
     access_token: str
@@ -55,9 +57,13 @@ class Token(BaseModel):
     role: str
     user_id: str
     email: Optional[str] = None
+    name: Optional[str] = None
     profile_id: Optional[str] = None  # household_id or worker_id if applicable
     cooperative_id: Optional[str] = None
     worker_type: Optional[str] = None
+    user: Optional[dict] = None
+
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
 class UserResponse(BaseModel):
     id: str

@@ -14,6 +14,7 @@ from app.models.rating import (
 
 router = APIRouter(prefix="/ratings", tags=["Ratings & Reviews"])
 
+@router.post("", response_model=RatingResponse, status_code=status.HTTP_201_CREATED)
 @router.post("/", response_model=RatingResponse, status_code=status.HTTP_201_CREATED)
 def submit_rating(
     payload: RatingCreate,

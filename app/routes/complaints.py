@@ -24,6 +24,7 @@ _COMPLAINTS_BY_BOOKING: Dict[str, List[Dict[str, Any]]] = {}
 
 router = APIRouter(prefix="/complaints", tags=["Complaints & Disputes"])
 
+@router.post("", response_model=ComplaintResponse, status_code=status.HTTP_201_CREATED)
 @router.post("/", response_model=ComplaintResponse, status_code=status.HTTP_201_CREATED)
 def raise_complaint(
     payload: ComplaintCreate,

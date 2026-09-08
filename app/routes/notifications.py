@@ -13,6 +13,7 @@ from app.services.event_service import event_service
 
 router = APIRouter(prefix="/notifications", tags=["In-App Notifications"])
 
+@router.get("", response_model=NotificationListResponse)
 @router.get("/", response_model=NotificationListResponse)
 def get_my_notifications(
     current_user: dict = Depends(get_current_user),
