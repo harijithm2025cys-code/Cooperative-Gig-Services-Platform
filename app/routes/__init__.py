@@ -15,6 +15,7 @@ from app.routes.complaints import router as complaints_router
 from app.routes.association import router as association_router
 from app.routes.analytics import router as analytics_router
 from app.routes.ml import router as ml_router
+from app.routes.chat import router as chat_router
 
 __all__ = [
     "auth_router",
@@ -34,6 +35,7 @@ __all__ = [
     "association_router",
     "analytics_router",
     "ml_router",
+    "chat_router",
 ]
 
 

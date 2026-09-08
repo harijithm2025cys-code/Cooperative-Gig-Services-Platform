@@ -24,6 +24,7 @@ from app.routes import (
     association_router,
     analytics_router,
     ml_router,
+    chat_router,
 )
 
 # Logging configuration
@@ -133,6 +134,7 @@ def create_application() -> FastAPI:
     application.include_router(association_router)
     application.include_router(analytics_router)
     application.include_router(ml_router)
+    application.include_router(chat_router)
 
     return application
 
